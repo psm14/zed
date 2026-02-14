@@ -1091,6 +1091,10 @@
     //
     // Default: true
     "expand_edit_card": true,
+    // Whether to hide keep/reject controls in the agent panel and automatically keep edits when a turn completes.
+    //
+    // Default: false
+    "auto_keep_edits": false,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
     // Default: true

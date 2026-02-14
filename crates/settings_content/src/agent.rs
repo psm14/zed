@@ -106,6 +106,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_edit_card: Option<bool>,
+    /// Whether to hide keep/reject controls in the agent panel and automatically keep edits when a turn finishes.
+    ///
+    /// Default: false
+    pub auto_keep_edits: Option<bool>,
     /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     ///
     /// Default: true

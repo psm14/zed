@@ -1367,6 +1367,9 @@ impl AcpThreadView {
     // edits
 
     pub fn keep_all(&mut self, _: &KeepAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if AgentSettings::get_global(cx).auto_keep_edits {
+            return;
+        }
         let thread = &self.thread;
         let telemetry = ActionLogTelemetry::from(thread.read(cx));
         let action_log = thread.read(cx).action_log().clone();
@@ -1376,6 +1379,9 @@ impl AcpThreadView {
     }
 
     pub fn reject_all(&mut self, _: &RejectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if AgentSettings::get_global(cx).auto_keep_edits {
+            return;
+        }
         let thread = &self.thread;
         let telemetry = ActionLogTelemetry::from(thread.read(cx));
         let action_log = thread.read(cx).action_log().clone();
@@ -1890,6 +1896,7 @@ impl AcpThreadView {
         editor_bg_color: Hsla,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let auto_keep_edits = AgentSettings::get_global(cx).auto_keep_edits;
         h_flex()
             .id("edited-buttons-container")
             .visible_on_hover("edited-code")
@@ -1916,50 +1923,54 @@ impl AcpThreadView {
                         })
                     }),
             )
-            .child(
-                Button::new(("reject-file", index), "Reject")
-                    .label_size(LabelSize::Small)
-                    .disabled(pending_edits)
-                    .on_click({
-                        let buffer = buffer.clone();
-                        let action_log = action_log.clone();
-                        let telemetry = telemetry.clone();
-                        move |_, _, cx| {
-                            action_log.update(cx, |action_log, cx| {
-                                action_log
-                                    .reject_edits_in_ranges(
+            .when(!auto_keep_edits, |this| {
+                this.child(
+                    Button::new(("reject-file", index), "Reject")
+                        .label_size(LabelSize::Small)
+                        .disabled(pending_edits)
+                        .on_click({
+                            let buffer = buffer.clone();
+                            let action_log = action_log.clone();
+                            let telemetry = telemetry.clone();
+                            move |_, _, cx| {
+                                action_log.update(cx, |action_log, cx| {
+                                    action_log
+                                        .reject_edits_in_ranges(
+                                            buffer.clone(),
+                                            vec![Anchor::min_max_range_for_buffer(
+                                                buffer.read(cx).remote_id(),
+                                            )],
+                                            Some(telemetry.clone()),
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                })
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(("keep-file", index), "Keep")
+                        .label_size(LabelSize::Small)
+                        .disabled(pending_edits)
+                        .on_click({
+                            let buffer = buffer.clone();
+                            let action_log = action_log.clone();
+                            let telemetry = telemetry.clone();
+                            move |_, _, cx| {
+                                action_log.update(cx, |action_log, cx| {
+                                    action_log.keep_edits_in_range(
                                         buffer.clone(),
-                                        vec![Anchor::min_max_range_for_buffer(
+                                        Anchor::min_max_range_for_buffer(
                                             buffer.read(cx).remote_id(),
-                                        )],
+                                        ),
                                         Some(telemetry.clone()),
                                         cx,
-                                    )
-                                    .detach_and_log_err(cx);
-                            })
-                        }
-                    }),
-            )
-            .child(
-                Button::new(("keep-file", index), "Keep")
-                    .label_size(LabelSize::Small)
-                    .disabled(pending_edits)
-                    .on_click({
-                        let buffer = buffer.clone();
-                        let action_log = action_log.clone();
-                        let telemetry = telemetry.clone();
-                        move |_, _, cx| {
-                            action_log.update(cx, |action_log, cx| {
-                                action_log.keep_edits_in_range(
-                                    buffer.clone(),
-                                    Anchor::min_max_range_for_buffer(buffer.read(cx).remote_id()),
-                                    Some(telemetry.clone()),
-                                    cx,
-                                );
-                            })
-                        }
-                    }),
-            )
+                                    );
+                                })
+                            }
+                        }),
+                )
+            })
     }
 
     fn render_message_queue_summary(
@@ -2176,6 +2187,7 @@ impl AcpThreadView {
         cx: &Context<Self>,
     ) -> Div {
         const EDIT_NOT_READY_TOOLTIP_LABEL: &str = "Wait until file edits are complete.";
+        let auto_keep_edits = AgentSettings::get_global(cx).auto_keep_edits;
 
         let focus_handle = self.focus_handle(cx);
 
@@ -2275,37 +2287,43 @@ impl AcpThreadView {
                                 window.dispatch_action(OpenAgentDiff.boxed_clone(), cx);
                             })),
                     )
-                    .child(Divider::vertical().color(DividerColor::Border))
-                    .child(
-                        Button::new("reject-all-changes", "Reject All")
-                            .label_size(LabelSize::Small)
-                            .disabled(pending_edits)
-                            .when(pending_edits, |this| {
-                                this.tooltip(Tooltip::text(EDIT_NOT_READY_TOOLTIP_LABEL))
-                            })
-                            .key_binding(
-                                KeyBinding::for_action_in(&RejectAll, &focus_handle.clone(), cx)
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                    .when(!auto_keep_edits, |this| {
+                        this.child(Divider::vertical().color(DividerColor::Border))
+                            .child(
+                                Button::new("reject-all-changes", "Reject All")
+                                    .label_size(LabelSize::Small)
+                                    .disabled(pending_edits)
+                                    .when(pending_edits, |this| {
+                                        this.tooltip(Tooltip::text(EDIT_NOT_READY_TOOLTIP_LABEL))
+                                    })
+                                    .key_binding(
+                                        KeyBinding::for_action_in(
+                                            &RejectAll,
+                                            &focus_handle.clone(),
+                                            cx,
+                                        )
+                                        .map(|kb| kb.size(rems_from_px(10.))),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.reject_all(&RejectAll, window, cx);
+                                    })),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.reject_all(&RejectAll, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("keep-all-changes", "Keep All")
-                            .label_size(LabelSize::Small)
-                            .disabled(pending_edits)
-                            .when(pending_edits, |this| {
-                                this.tooltip(Tooltip::text(EDIT_NOT_READY_TOOLTIP_LABEL))
-                            })
-                            .key_binding(
-                                KeyBinding::for_action_in(&KeepAll, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                            .child(
+                                Button::new("keep-all-changes", "Keep All")
+                                    .label_size(LabelSize::Small)
+                                    .disabled(pending_edits)
+                                    .when(pending_edits, |this| {
+                                        this.tooltip(Tooltip::text(EDIT_NOT_READY_TOOLTIP_LABEL))
+                                    })
+                                    .key_binding(
+                                        KeyBinding::for_action_in(&KeepAll, &focus_handle, cx)
+                                            .map(|kb| kb.size(rems_from_px(10.))),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.keep_all(&KeepAll, window, cx);
+                                    })),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.keep_all(&KeepAll, window, cx);
-                            })),
-                    ),
+                    }),
             )
     }
 

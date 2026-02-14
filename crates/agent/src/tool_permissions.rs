@@ -558,6 +558,7 @@ mod tests {
             model_parameters: vec![],
             enable_feedback: false,
             expand_edit_card: true,
+            auto_keep_edits: false,
             expand_terminal_card: true,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,

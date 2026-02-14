@@ -293,6 +293,19 @@ The default value is `true`.
 
 When set to `false`, these controls are only available in the multibuffer review tab.
 
+### Auto Keep Edits
+
+Use `auto_keep_edits` to hide keep/reject controls in the Agent Panel and automatically keep all edits when a turn finishes.
+The default value is `false`.
+
+```json [settings]
+{
+  "agent": {
+    "auto_keep_edits": true
+  }
+}
+```
+
 ### Sound Notification
 
 Control whether to hear a notification sound when the agent is done generating changes or needs your input.
