@@ -945,6 +945,7 @@ impl Server {
             connection_id,
             proto::Hello {
                 peer_id: Some(connection_id.into()),
+                user_id: session.user_id().to_proto(),
             },
         )?;
         tracing::info!("sent hello message");

@@ -1,6 +1,6 @@
 use crate::{
     AppState, Error, Result,
-    db::{self, AccessTokenId, Database, UserId},
+    db::{self, AccessTokenId, Database, NewUserParams, User, UserId},
     rpc::Principal,
 };
 use anyhow::Context as _;
@@ -23,9 +23,9 @@ use std::{sync::Arc, time::Instant};
 use subtle::ConstantTimeEq;
 
 /// Validates the authorization header and adds an Extension<Principal> to the request.
-/// Authorization: <user-id> <token>
+/// Authorization: <user-id|github-login> <token>
 ///   <token> can be an access_token attached to that user, or an access token of an admin
-///   or (in development) the string ADMIN:<config.api_token>.
+///   or the string ADMIN_TOKEN:<config.api_token>.
 /// Authorization: "dev-server-token" <token>
 pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl IntoResponse {
     let mut auth_header = req
@@ -50,13 +50,6 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
         ))?;
     }
 
-    let user_id = UserId(first.parse().map_err(|_| {
-        Error::http(
-            StatusCode::BAD_REQUEST,
-            "missing user id in authorization header".to_string(),
-        )
-    })?);
-
     let access_token = auth_header.next().ok_or_else(|| {
         Error::http(
             StatusCode::BAD_REQUEST,
@@ -64,48 +57,131 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
         )
     })?;
 
-    // In development, allow impersonation using the admin API token.
-    // Don't allow this in production because we can't tell who is doing
-    // the impersonating.
-    let validate_result = if let (Some(admin_token), true) = (
-        access_token.strip_prefix("ADMIN_TOKEN:"),
-        state.config.is_development(),
-    ) {
-        Ok(VerifyAccessTokenResult {
-            is_valid: state.config.api_token == admin_token,
-            impersonator_id: None,
-        })
-    } else {
-        verify_access_token(access_token, user_id, &state.db).await
-    };
+    if let Ok(user_id) = first.parse::<i32>() {
+        let user_id = UserId(user_id);
 
-    if let Ok(validate_result) = validate_result
-        && validate_result.is_valid
-    {
-        let user = state
-            .db
-            .get_user_by_id(user_id)
-            .await?
-            .with_context(|| format!("user {user_id} not found"))?;
-
-        if let Some(impersonator_id) = validate_result.impersonator_id {
-            let admin = state
-                .db
-                .get_user_by_id(impersonator_id)
-                .await?
-                .with_context(|| format!("user {impersonator_id} not found"))?;
-            req.extensions_mut()
-                .insert(Principal::Impersonated { user, admin });
+        // In development, allow impersonation using the admin API token.
+        // Don't allow this in production because we can't tell who is doing
+        // the impersonating.
+        let validate_result = if let (Some(admin_token), true) = (
+            access_token.strip_prefix("ADMIN_TOKEN:"),
+            state.config.is_development(),
+        ) {
+            Ok(VerifyAccessTokenResult {
+                is_valid: state.config.api_token == admin_token,
+                impersonator_id: None,
+            })
         } else {
-            req.extensions_mut().insert(Principal::User(user));
+            verify_access_token(access_token, user_id, &state.db).await
         };
-        return Ok::<_, Error>(next.run(req).await);
+
+        if let Ok(validate_result) = validate_result
+            && validate_result.is_valid
+        {
+            let user = state
+                .db
+                .get_user_by_id(user_id)
+                .await?
+                .with_context(|| format!("user {user_id} not found"))?;
+
+            if let Some(impersonator_id) = validate_result.impersonator_id {
+                let admin = state
+                    .db
+                    .get_user_by_id(impersonator_id)
+                    .await?
+                    .with_context(|| format!("user {impersonator_id} not found"))?;
+                req.extensions_mut()
+                    .insert(Principal::Impersonated { user, admin });
+            } else {
+                req.extensions_mut().insert(Principal::User(user));
+            };
+            return Ok::<_, Error>(next.run(req).await);
+        }
+
+        return Err(Error::http(
+            StatusCode::UNAUTHORIZED,
+            "invalid credentials".to_string(),
+        ));
     }
 
-    Err(Error::http(
-        StatusCode::UNAUTHORIZED,
-        "invalid credentials".to_string(),
-    ))
+    let github_login = first.trim();
+    if github_login.is_empty() {
+        return Err(Error::http(
+            StatusCode::BAD_REQUEST,
+            "missing user id in authorization header".to_string(),
+        ));
+    }
+    let github_login = github_login.to_ascii_lowercase();
+    if !is_valid_github_login(&github_login) {
+        return Err(Error::http(
+            StatusCode::BAD_REQUEST,
+            "invalid github login in authorization header".to_string(),
+        ));
+    }
+
+    let Some(admin_token) = access_token.strip_prefix("ADMIN_TOKEN:") else {
+        return Err(Error::http(
+            StatusCode::UNAUTHORIZED,
+            "invalid credentials".to_string(),
+        ));
+    };
+    if state.config.api_token != admin_token {
+        return Err(Error::http(
+            StatusCode::UNAUTHORIZED,
+            "invalid credentials".to_string(),
+        ));
+    }
+
+    let user = get_or_create_user_for_trusted_login(&github_login, &state.db).await?;
+    req.extensions_mut().insert(Principal::User(user));
+    Ok::<_, Error>(next.run(req).await)
+}
+
+fn is_valid_github_login(github_login: &str) -> bool {
+    if github_login.len() > 39 {
+        return false;
+    }
+    let mut chars = github_login.chars();
+    let Some(first_char) = chars.next() else {
+        return false;
+    };
+    if !(first_char.is_ascii_alphanumeric()) {
+        return false;
+    }
+    chars.all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+async fn get_or_create_user_for_trusted_login(
+    github_login: &str,
+    db: &Arc<Database>,
+) -> Result<User> {
+    if let Some(user) = db.get_user_by_github_login(github_login).await? {
+        return Ok(user);
+    }
+
+    db.create_user(
+        &format!("{github_login}@example.com"),
+        None,
+        false,
+        NewUserParams {
+            github_login: github_login.to_string(),
+            github_user_id: synthetic_github_user_id(github_login),
+        },
+    )
+    .await?;
+
+    db.get_user_by_github_login(github_login)
+        .await?
+        .with_context(|| format!("user {github_login} not found after create"))
+        .map_err(Into::into)
+}
+
+fn synthetic_github_user_id(github_login: &str) -> i32 {
+    let digest = sha2::Sha256::digest(github_login);
+    let mut bytes = [0_u8; 4];
+    bytes.copy_from_slice(&digest[..4]);
+    let id = i32::from_be_bytes(bytes) & 0x7fff_ffff;
+    if id == 0 { 1 } else { id }
 }
 
 pub const MAX_ACCESS_TOKENS_TO_STORE: usize = 8;

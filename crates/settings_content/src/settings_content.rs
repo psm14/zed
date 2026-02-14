@@ -67,6 +67,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 pub use util::serde::default_true;
 
+#[with_fallible_options]
+#[derive(Debug, PartialEq, Default, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct TrustedCollaborationSettingsContent {
+    /// GitHub login to use as the trusted identity for collaboration.
+    pub github_login: Option<String>,
+    /// Shared API token used for trusted local/private collaboration auth.
+    pub admin_api_token: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseStatus {
     /// Settings were parsed successfully
@@ -178,6 +187,10 @@ pub struct SettingsContent {
 
     /// The URL of the Zed server to connect to.
     pub server_url: Option<String>,
+    /// Optional direct URL for the collaboration websocket endpoint.
+    pub collaboration_server_url: Option<String>,
+    /// Trusted collaboration settings for private deployments.
+    pub trusted_collaboration: Option<TrustedCollaborationSettingsContent>,
 
     /// Configuration for session-related features
     pub session: Option<SessionSettingsContent>,
