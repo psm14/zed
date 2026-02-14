@@ -26,6 +26,10 @@ pub struct AcpBetaFeatureFlag;
 
 impl FeatureFlag for AcpBetaFeatureFlag {
     const NAME: &'static str = "acp-beta";
+
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 
 pub struct AgentSharingFeatureFlag;
