@@ -1550,6 +1550,11 @@
       // to improve the service.
       "privacy_mode": false,
     },
+    "llama_cpp": {
+      "api_url": "http://localhost:8080",
+      "model": null,
+      "max_output_tokens": 128,
+    },
     "ollama": {
       "api_url": "http://localhost:11434",
       "model": "qwen2.5-coder:7b-base",

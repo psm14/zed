@@ -190,6 +190,7 @@ fn assign_edit_prediction_provider(
         }
         value @ (EditPredictionProvider::Experimental(_)
         | EditPredictionProvider::Zed
+        | EditPredictionProvider::LlamaCpp
         | EditPredictionProvider::Ollama
         | EditPredictionProvider::Sweep
         | EditPredictionProvider::Mercury) => {
@@ -212,6 +213,12 @@ fn assign_edit_prediction_provider(
                                 return false;
                             }
                             edit_prediction::EditPredictionModel::Ollama
+                        }
+                        EditPredictionProvider::LlamaCpp => {
+                            if !edit_prediction::llama_cpp::is_available(cx) {
+                                return false;
+                            }
+                            edit_prediction::EditPredictionModel::LlamaCpp
                         }
                         EditPredictionProvider::Experimental(name)
                             if name == EXPERIMENTAL_ZETA2_EDIT_PREDICTION_PROVIDER_NAME

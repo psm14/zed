@@ -349,6 +349,57 @@ impl Render for EditPredictionButton {
                         .with_handle(self.popover_menu_handle.clone()),
                 )
             }
+            EditPredictionProvider::LlamaCpp => {
+                let enabled = self.editor_enabled.unwrap_or(true);
+                let this = cx.weak_entity();
+
+                div().child(
+                    PopoverMenu::new("llama-cpp")
+                        .menu(move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.build_edit_prediction_context_menu(
+                                    EditPredictionProvider::LlamaCpp,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok()
+                        })
+                        .anchor(Corner::BottomRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("llama-cpp-icon", IconName::Ai)
+                                .shape(IconButtonShape::Square)
+                                .when(!enabled, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Ignored))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                }),
+                            move |_window, cx| {
+                                let settings = all_language_settings(None, cx);
+                                let configured_model = settings
+                                    .edit_predictions
+                                    .llama_cpp
+                                    .model
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|model| !model.is_empty());
+                                let tooltip_meta = match configured_model {
+                                    Some(model) => format!("Powered by llama.cpp ({model})"),
+                                    None => "Powered by llama.cpp".to_string(),
+                                };
+
+                                Tooltip::with_meta(
+                                    "Edit Prediction",
+                                    Some(&ToggleMenu),
+                                    tooltip_meta,
+                                    cx,
+                                )
+                            },
+                        )
+                        .with_handle(self.popover_menu_handle.clone()),
+                )
+            }
             EditPredictionProvider::Ollama => {
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let this = cx.weak_entity();
@@ -1494,6 +1545,10 @@ pub fn get_available_providers(cx: &mut App) -> Vec<EditPredictionProvider> {
 
     if codestral::codestral_api_key(cx).is_some() {
         providers.push(EditPredictionProvider::Codestral);
+    }
+
+    if edit_prediction::llama_cpp::is_available(cx) {
+        providers.push(EditPredictionProvider::LlamaCpp);
     }
 
     if edit_prediction::ollama::is_available(cx) {

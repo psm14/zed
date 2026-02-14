@@ -55,6 +55,7 @@ use workspace::notifications::{ErrorMessagePrompt, NotificationId, show_app_noti
 pub mod cursor_excerpt;
 pub mod example_spec;
 mod license_detection;
+pub mod llama_cpp;
 pub mod mercury;
 pub mod ollama;
 mod onboarding_modal;
@@ -73,6 +74,7 @@ pub mod zeta2;
 mod edit_prediction_tests;
 
 use crate::license_detection::LicenseDetectionWatcher;
+use crate::llama_cpp::LlamaCpp;
 use crate::mercury::Mercury;
 use crate::ollama::Ollama;
 use crate::onboarding_modal::ZedPredictModal;
@@ -137,6 +139,7 @@ pub struct EditPredictionStore {
     zeta2_raw_config: Option<Zeta2RawConfig>,
     pub sweep_ai: SweepAi,
     pub mercury: Mercury,
+    pub llama_cpp: LlamaCpp,
     pub ollama: Ollama,
     data_collection_choice: DataCollectionChoice,
     reject_predictions_tx: mpsc::UnboundedSender<EditPredictionRejection>,
@@ -151,6 +154,7 @@ pub enum EditPredictionModel {
     Zeta2,
     Sweep,
     Mercury,
+    LlamaCpp,
     Ollama,
 }
 
@@ -687,6 +691,7 @@ impl EditPredictionStore {
             zeta2_raw_config: Self::zeta2_raw_config_from_env(),
             sweep_ai: SweepAi::new(cx),
             mercury: Mercury::new(cx),
+            llama_cpp: LlamaCpp::new(),
             ollama: Ollama::new(),
 
             data_collection_choice,
@@ -736,6 +741,9 @@ impl EditPredictionStore {
                     .with_up(IconName::ZedPredictUp)
                     .with_down(IconName::ZedPredictDown)
                     .with_error(IconName::ZedPredictError)
+            }
+            EditPredictionModel::LlamaCpp => {
+                edit_prediction_types::EditPredictionIconSet::new(IconName::Ai)
             }
             EditPredictionModel::Ollama => {
                 edit_prediction_types::EditPredictionIconSet::new(IconName::AiOllama)
@@ -1285,6 +1293,7 @@ impl EditPredictionStore {
                     cx,
                 );
             }
+            EditPredictionModel::LlamaCpp => {}
             EditPredictionModel::Ollama => {}
             EditPredictionModel::Zeta1 | EditPredictionModel::Zeta2 => {
                 zeta2::edit_prediction_accepted(self, current_prediction, cx)
@@ -1431,7 +1440,9 @@ impl EditPredictionStore {
                     })
                     .log_err();
             }
-            EditPredictionModel::Sweep | EditPredictionModel::Ollama => {}
+            EditPredictionModel::Sweep
+            | EditPredictionModel::LlamaCpp
+            | EditPredictionModel::Ollama => {}
             EditPredictionModel::Mercury => {
                 mercury::edit_prediction_rejected(
                     prediction_id,
@@ -1621,9 +1632,12 @@ impl EditPredictionStore {
             -> Task<Result<Option<(EditPredictionResult, PredictionRequestedBy)>>>
         + 'static,
     ) {
-        let is_ollama = self.edit_prediction_model == EditPredictionModel::Ollama;
-        let drop_on_cancel = is_ollama;
-        let max_pending_predictions = if is_ollama { 1 } else { 2 };
+        let is_local_provider = matches!(
+            self.edit_prediction_model,
+            EditPredictionModel::Ollama | EditPredictionModel::LlamaCpp
+        );
+        let drop_on_cancel = is_local_provider;
+        let max_pending_predictions = if is_local_provider { 1 } else { 2 };
         let project_state = self.get_or_init_project(&project, cx);
         let pending_prediction_id = project_state.next_pending_prediction_id;
         project_state.next_pending_prediction_id += 1;
@@ -1854,6 +1868,7 @@ impl EditPredictionStore {
             ),
             EditPredictionModel::Sweep => self.sweep_ai.request_prediction_with_sweep(inputs, cx),
             EditPredictionModel::Mercury => self.mercury.request_prediction(inputs, cx),
+            EditPredictionModel::LlamaCpp => self.llama_cpp.request_prediction(inputs, cx),
             EditPredictionModel::Ollama => self.ollama.request_prediction(inputs, cx),
         };
 

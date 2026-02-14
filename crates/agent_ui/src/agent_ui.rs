@@ -405,6 +405,7 @@ fn update_command_palette_filter(cx: &mut App) {
                 }
                 EditPredictionProvider::Zed
                 | EditPredictionProvider::Codestral
+                | EditPredictionProvider::LlamaCpp
                 | EditPredictionProvider::Ollama
                 | EditPredictionProvider::Sweep
                 | EditPredictionProvider::Mercury

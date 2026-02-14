@@ -84,6 +84,7 @@ pub enum EditPredictionProvider {
     Supermaven,
     Zed,
     Codestral,
+    LlamaCpp,
     Ollama,
     Sweep,
     Mercury,
@@ -105,6 +106,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Supermaven,
             Zed,
             Codestral,
+            LlamaCpp,
             Ollama,
             Sweep,
             Mercury,
@@ -117,6 +119,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Content::Supermaven => EditPredictionProvider::Supermaven,
             Content::Zed => EditPredictionProvider::Zed,
             Content::Codestral => EditPredictionProvider::Codestral,
+            Content::LlamaCpp => EditPredictionProvider::LlamaCpp,
             Content::Ollama => EditPredictionProvider::Ollama,
             Content::Sweep => EditPredictionProvider::Sweep,
             Content::Mercury => EditPredictionProvider::Mercury,
@@ -145,6 +148,7 @@ impl EditPredictionProvider {
             | EditPredictionProvider::Copilot
             | EditPredictionProvider::Supermaven
             | EditPredictionProvider::Codestral
+            | EditPredictionProvider::LlamaCpp
             | EditPredictionProvider::Ollama
             | EditPredictionProvider::Sweep
             | EditPredictionProvider::Mercury
@@ -158,6 +162,7 @@ impl EditPredictionProvider {
             EditPredictionProvider::Copilot => Some("GitHub Copilot"),
             EditPredictionProvider::Supermaven => Some("Supermaven"),
             EditPredictionProvider::Codestral => Some("Codestral"),
+            EditPredictionProvider::LlamaCpp => Some("llama.cpp"),
             EditPredictionProvider::Sweep => Some("Sweep"),
             EditPredictionProvider::Mercury => Some("Mercury"),
             EditPredictionProvider::Experimental(
@@ -188,6 +193,8 @@ pub struct EditPredictionSettingsContent {
     pub codestral: Option<CodestralSettingsContent>,
     /// Settings specific to Sweep.
     pub sweep: Option<SweepSettingsContent>,
+    /// Settings specific to llama.cpp.
+    pub llama_cpp: Option<LlamaCppEditPredictionSettingsContent>,
     /// Settings specific to Ollama.
     pub ollama: Option<OllamaEditPredictionSettingsContent>,
     /// Whether edit predictions are enabled in the assistant prompt editor.
@@ -245,6 +252,23 @@ pub struct SweepSettingsContent {
     ///
     /// Default: false
     pub privacy_mode: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct LlamaCppEditPredictionSettingsContent {
+    /// Base URL of your llama.cpp server.
+    ///
+    /// Default: "http://localhost:8080"
+    pub api_url: Option<String>,
+    /// Optional model identifier when running in multi-model mode.
+    ///
+    /// Default: none
+    pub model: Option<String>,
+    /// Maximum number of tokens to generate.
+    ///
+    /// Default: 128
+    pub max_output_tokens: Option<u32>,
 }
 
 /// Ollama model name for edit predictions.
