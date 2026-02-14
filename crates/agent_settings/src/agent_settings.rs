@@ -25,6 +25,10 @@ pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
 pub struct AgentSettings {
     pub enabled: bool,
     pub button: bool,
+    pub show_zed_agent: bool,
+    pub show_claude_code: bool,
+    pub show_codex_cli: bool,
+    pub show_gemini_cli: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
     pub default_height: Pixels,
@@ -405,6 +409,10 @@ impl Settings for AgentSettings {
         Self {
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
+            show_zed_agent: agent.show_zed_agent.unwrap(),
+            show_claude_code: agent.show_claude_code.unwrap(),
+            show_codex_cli: agent.show_codex_cli.unwrap(),
+            show_gemini_cli: agent.show_gemini_cli.unwrap(),
             dock: agent.dock.unwrap(),
             default_width: px(agent.default_width.unwrap()),
             default_height: px(agent.default_height.unwrap()),
