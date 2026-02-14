@@ -1,0 +1,46 @@
+name: fork_build
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+on:
+  pull_request:
+    branches:
+    - '**'
+  push:
+    branches:
+    - main
+    - v[0-9]+.[0-9]+.x
+  workflow_dispatch: {}
+jobs:
+  check_linux:
+    if: github.repository_owner != 'zed-industries' && github.repository_owner != 'zed-extensions'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        clean: false
+    - name: steps::setup_cargo_config
+      run: |
+        mkdir -p ./../.cargo
+        cp ./.cargo/ci-config.toml ./../.cargo/config.toml
+    - name: steps::setup_linux
+      run: ./script/linux
+    - name: steps::install_mold
+      run: ./script/install-mold
+    - name: steps::download_wasi_sdk
+      run: ./script/download-wasi-sdk
+    - name: steps::smoke_build_zed
+      run: cargo check --locked --package zed
+    - name: steps::cleanup_cargo_config
+      if: always()
+      run: |
+        rm -rf ./../.cargo
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}

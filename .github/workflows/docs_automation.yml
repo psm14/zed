@@ -27,6 +27,7 @@ env:
 
 jobs:
   docs-automation:
+    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
     runs-on: namespace-profile-8x32-ubuntu-2404
     timeout-minutes: 30
 
