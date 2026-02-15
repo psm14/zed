@@ -74,7 +74,8 @@ use workspace::{
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        OpenAcpOnboardingModal, OpenOnboardingModal, OpenSettings, ResetAgentZoom, ResetOnboarding,
+        NewThreadInEditorTab, OpenAcpOnboardingModal, OpenOnboardingModal, OpenSettings,
+        ResetAgentZoom, ResetOnboarding,
     },
     assistant::{OpenRulesLibrary, ToggleFocus},
 };
@@ -137,6 +138,13 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| panel.new_thread(action, window, cx));
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &NewThreadInEditorTab, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.new_thread_in_editor_tab(window, cx);
+                        });
                     }
                 })
                 .register_action(
@@ -1076,6 +1084,65 @@ impl AgentPanel {
         }
     }
 
+    fn new_thread_in_editor_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preferred_agent) = self.preferred_agent_for_new_thread(cx) else {
+            self.open_configuration(window, cx);
+            return;
+        };
+
+        match preferred_agent {
+            AgentType::TextThread => {
+                self.new_text_thread(window, cx);
+                self.open_active_thread_in_editor_tab(&OpenActiveThreadInEditorTab, window, cx);
+            }
+            AgentType::NativeAgent => self.external_thread_with_tab_mode(
+                Some(ExternalAgent::NativeAgent),
+                None,
+                None,
+                Some(true),
+                true,
+                window,
+                cx,
+            ),
+            AgentType::Gemini => self.external_thread_with_tab_mode(
+                Some(ExternalAgent::Gemini),
+                None,
+                None,
+                Some(true),
+                true,
+                window,
+                cx,
+            ),
+            AgentType::ClaudeCode => self.external_thread_with_tab_mode(
+                Some(ExternalAgent::ClaudeCode),
+                None,
+                None,
+                Some(true),
+                true,
+                window,
+                cx,
+            ),
+            AgentType::Codex => self.external_thread_with_tab_mode(
+                Some(ExternalAgent::Codex),
+                None,
+                None,
+                Some(true),
+                true,
+                window,
+                cx,
+            ),
+            AgentType::Custom { name } => self.external_thread_with_tab_mode(
+                Some(ExternalAgent::Custom { name }),
+                None,
+                None,
+                Some(true),
+                true,
+                window,
+                cx,
+            ),
+        }
+    }
+
     fn new_native_agent_thread_from_summary(
         &mut self,
         action: &NewNativeAgentThreadFromSummary,
@@ -1167,6 +1234,7 @@ impl AgentPanel {
             resume_thread,
             initial_content,
             None,
+            false,
             window,
             cx,
         );
@@ -1178,6 +1246,7 @@ impl AgentPanel {
         resume_thread: Option<AgentSessionInfo>,
         initial_content: Option<ExternalAgentInitialContent>,
         open_in_new_tab_override: Option<bool>,
+        open_in_editor_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1252,6 +1321,7 @@ impl AgentPanel {
                     project,
                     selected_external_agent,
                     open_in_new_tab,
+                    open_in_editor_tab,
                     window,
                     cx,
                 );
@@ -2289,7 +2359,15 @@ impl AgentPanel {
         let Some(agent) = self.selected_external_agent(cx) else {
             return;
         };
-        self.external_thread_with_tab_mode(Some(agent), Some(thread), None, Some(true), window, cx);
+        self.external_thread_with_tab_mode(
+            Some(agent),
+            Some(thread),
+            None,
+            Some(true),
+            false,
+            window,
+            cx,
+        );
     }
 
     fn _external_thread(
@@ -2301,6 +2379,7 @@ impl AgentPanel {
         project: Entity<Project>,
         ext_agent: ExternalAgent,
         open_in_new_tab: bool,
+        open_in_editor_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2335,6 +2414,9 @@ impl AgentPanel {
         });
 
         self.set_active_view(ActiveView::AgentThread { thread_view }, true, window, cx);
+        if open_in_editor_tab {
+            self.open_active_thread_in_editor_tab(&OpenActiveThreadInEditorTab, window, cx);
+        }
     }
 }
 
@@ -4087,7 +4169,7 @@ impl AgentPanel {
         };
 
         self._external_thread(
-            server, None, None, workspace, project, ext_agent, true, window, cx,
+            server, None, None, workspace, project, ext_agent, true, false, window, cx,
         );
     }
 

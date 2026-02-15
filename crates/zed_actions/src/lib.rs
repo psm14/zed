@@ -440,6 +440,8 @@ pub mod agent {
             ResetOnboarding,
             /// Starts a chat conversation with the agent.
             Chat,
+            /// Creates a new agent thread and opens it in the editor area.
+            NewThreadInEditorTab,
             /// Toggles the language model selector dropdown.
             #[action(deprecated_aliases = ["assistant::ToggleModelSelector", "assistant2::ToggleModelSelector"])]
             ToggleModelSelector,
