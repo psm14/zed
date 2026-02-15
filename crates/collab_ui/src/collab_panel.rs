@@ -6,7 +6,7 @@ use crate::{CollaborationPanelSettings, channel_view::ChannelView};
 use anyhow::Context as _;
 use call::ActiveCall;
 use channel::{Channel, ChannelEvent, ChannelStore};
-use client::{ChannelId, Client, Contact, User, UserStore};
+use client::{ChannelId, Client, ClientSettings, Contact, User, UserStore};
 use collections::{HashMap, HashSet};
 use contact_finder::ContactFinder;
 use db::kvp::KEY_VALUE_STORE;
@@ -218,6 +218,9 @@ pub struct CollabPanel {
     list_state: ListState,
     filter_editor: Entity<Editor>,
     channel_name_editor: Entity<Editor>,
+    trusted_collaboration_server_url_editor: Entity<Editor>,
+    trusted_collaboration_github_login_editor: Entity<Editor>,
+    trusted_collaboration_admin_api_token_editor: Entity<Editor>,
     channel_editing_state: Option<ChannelEditingState>,
     entries: Vec<ListEntry>,
     selection: Option<usize>,
@@ -323,6 +326,43 @@ impl CollabPanel {
             .detach();
 
             let channel_name_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let client_settings = ClientSettings::get_global(cx);
+            let collaboration_server_url = client_settings.collaboration_server_url.clone();
+            let github_login = client_settings.trusted_collaboration.github_login.clone();
+            let admin_api_token = client_settings
+                .trusted_collaboration
+                .admin_api_token
+                .clone();
+
+            let trusted_collaboration_server_url_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(
+                    "https://your-collaboration-server.example/rpc",
+                    window,
+                    cx,
+                );
+                if let Some(collaboration_server_url) = collaboration_server_url.as_deref() {
+                    editor.set_text(collaboration_server_url.to_string(), window, cx);
+                }
+                editor
+            });
+            let trusted_collaboration_github_login_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("GitHub username", window, cx);
+                if let Some(github_login) = github_login.as_deref() {
+                    editor.set_text(github_login.to_string(), window, cx);
+                }
+                editor
+            });
+            let trusted_collaboration_admin_api_token_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Admin API token", window, cx);
+                editor.set_masked(true, cx);
+                if let Some(admin_api_token) = admin_api_token.as_deref() {
+                    editor.set_text(admin_api_token.to_string(), window, cx);
+                }
+                editor
+            });
 
             cx.subscribe_in(
                 &channel_name_editor,
@@ -352,6 +392,9 @@ impl CollabPanel {
                 list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
                 channel_name_editor,
                 filter_editor,
+                trusted_collaboration_server_url_editor,
+                trusted_collaboration_github_login_editor,
+                trusted_collaboration_admin_api_token_editor,
                 entries: Vec::default(),
                 channel_editing_state: None,
                 selection: None,
@@ -1573,6 +1616,10 @@ impl CollabPanel {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shows_signed_out_view() {
+            return;
+        }
+
         if self.confirm_channel_edit(window, cx) {
             return;
         }
@@ -2297,6 +2344,41 @@ impl CollabPanel {
         .detach_and_prompt_err("Failed to join channel", window, cx, |_, _, _| None)
     }
 
+    fn shows_signed_out_view(&self) -> bool {
+        !self.client.status().borrow().is_or_was_connected()
+    }
+
+    fn trimmed_editor_text(editor: &Entity<Editor>, cx: &App) -> Option<String> {
+        let value = editor.read(cx).text(cx);
+        let trimmed_value = value.trim();
+        if trimmed_value.is_empty() {
+            None
+        } else {
+            Some(trimmed_value.to_string())
+        }
+    }
+
+    fn save_trusted_collaboration_settings(&self, cx: &mut Context<Self>) {
+        let collaboration_server_url =
+            Self::trimmed_editor_text(&self.trusted_collaboration_server_url_editor, cx);
+        let github_login =
+            Self::trimmed_editor_text(&self.trusted_collaboration_github_login_editor, cx);
+        let admin_api_token =
+            Self::trimmed_editor_text(&self.trusted_collaboration_admin_api_token_editor, cx);
+
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            settings.collaboration_server_url = collaboration_server_url;
+
+            if github_login.is_none() && admin_api_token.is_none() {
+                settings.trusted_collaboration = None;
+            } else {
+                let trusted_collaboration = settings.trusted_collaboration.get_or_insert_default();
+                trusted_collaboration.github_login = github_login;
+                trusted_collaboration.admin_api_token = admin_api_token;
+            }
+        });
+    }
+
     fn copy_channel_link(&mut self, channel_id: ChannelId, cx: &mut Context<Self>) {
         let channel_store = self.channel_store.read(cx);
         let Some(channel) = channel_store.channel_for_id(channel_id) else {
@@ -2319,7 +2401,7 @@ impl CollabPanel {
         let collab_blurb = "Work with your team in realtime with collaborative editing, voice, shared notes and more.";
 
         v_flex()
-            .gap_6()
+            .gap_4()
             .p_4()
             .child(Label::new(collab_blurb))
             .child(
@@ -2351,6 +2433,46 @@ impl CollabPanel {
                                 .color(Color::Muted)
                                 .size(LabelSize::Small),
                         ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("Trusted collaboration settings")
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                    .child(self.render_signed_out_setting_input(
+                        "Collaboration server URL",
+                        &self.trusted_collaboration_server_url_editor,
+                        cx,
+                    ))
+                    .child(self.render_signed_out_setting_input(
+                        "GitHub username",
+                        &self.trusted_collaboration_github_login_editor,
+                        cx,
+                    ))
+                    .child(self.render_signed_out_setting_input(
+                        "Admin API token",
+                        &self.trusted_collaboration_admin_api_token_editor,
+                        cx,
+                    ))
+                    .child(
+                        Label::new("Save trusted settings before signing in.")
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        Button::new(
+                            "save_trusted_collaboration_settings",
+                            "Save trusted settings",
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .full_width()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.save_trusted_collaboration_settings(cx);
+                        })),
                     ),
             )
     }
@@ -2511,6 +2633,30 @@ impl CollabPanel {
                 ..Default::default()
             },
         )
+    }
+
+    fn render_signed_out_setting_input(
+        &self,
+        label: &'static str,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let colors = cx.theme().colors();
+        v_flex()
+            .gap_1()
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .w_full()
+                    .py_1()
+                    .px_2()
+                    .h_8()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.editor_background)
+                    .child(self.render_filter_input(editor, cx)),
+            )
     }
 
     fn render_header(
@@ -3118,7 +3264,7 @@ impl Render for CollabPanel {
             .on_action(cx.listener(CollabPanel::move_channel_down))
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(if !self.client.status().borrow().is_or_was_connected() {
+            .child(if self.shows_signed_out_view() {
                 self.render_signed_out(cx)
             } else {
                 self.render_signed_in(window, cx)
@@ -3199,7 +3345,12 @@ impl Panel for CollabPanel {
 
 impl Focusable for CollabPanel {
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
-        self.filter_editor.focus_handle(cx)
+        if self.shows_signed_out_view() {
+            self.trusted_collaboration_server_url_editor
+                .focus_handle(cx)
+        } else {
+            self.filter_editor.focus_handle(cx)
+        }
     }
 }
 
