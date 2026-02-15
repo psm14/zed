@@ -4,6 +4,7 @@ use acp_thread::{AcpThread, AgentSessionInfo};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol as acp;
 use agent_servers::AgentServer;
+use collections::HashMap;
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
 use project::{
     ExternalAgentServerName,
@@ -501,6 +502,7 @@ pub struct AgentPanel {
     active_view: ActiveView,
     active_thread_tab_id: usize,
     inactive_thread_tabs: Vec<InactiveThreadTab>,
+    pending_agent_session_ids_by_thread_view: HashMap<EntityId, acp::SessionId>,
     next_thread_tab_id: usize,
     previous_view: Option<ActiveView>,
     _active_view_observation: Option<Subscription>,
@@ -779,6 +781,7 @@ impl AgentPanel {
             active_view,
             active_thread_tab_id: 0,
             inactive_thread_tabs: Vec::new(),
+            pending_agent_session_ids_by_thread_view: HashMap::default(),
             next_thread_tab_id: 1,
             workspace,
             user_store,
@@ -898,6 +901,63 @@ impl AgentPanel {
             | ActiveView::History { .. }
             | ActiveView::Configuration => None,
         }
+    }
+
+    fn agent_thread_session_id(
+        &self,
+        thread_view: &Entity<AcpServerView>,
+        cx: &App,
+    ) -> Option<acp::SessionId> {
+        thread_view
+            .read(cx)
+            .active_thread()
+            .map(|active_thread| active_thread.read(cx).thread.read(cx).session_id().clone())
+            .or_else(|| {
+                self.pending_agent_session_ids_by_thread_view
+                    .get(&Entity::entity_id(thread_view))
+                    .cloned()
+            })
+    }
+
+    fn agent_thread_session_id_for_view(
+        &self,
+        view: &ActiveView,
+        cx: &App,
+    ) -> Option<acp::SessionId> {
+        let ActiveView::AgentThread { thread_view } = view else {
+            return None;
+        };
+        self.agent_thread_session_id(thread_view, cx)
+    }
+
+    fn thread_view_id_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<EntityId> {
+        if let Some(current_view) = self.current_thread_view_for_tabs()
+            && self
+                .agent_thread_session_id_for_view(current_view, cx)
+                .as_ref()
+                .is_some_and(|candidate_session_id| candidate_session_id == session_id)
+        {
+            return Self::agent_thread_view_id(current_view);
+        }
+
+        self.inactive_thread_tabs.iter().find_map(|tab| {
+            self.agent_thread_session_id_for_view(&tab.view, cx)
+                .as_ref()
+                .filter(|candidate_session_id| *candidate_session_id == session_id)
+                .and_then(|_| Self::agent_thread_view_id(&tab.view))
+        })
+    }
+
+    fn clear_pending_session_id_for_view(&mut self, view: &ActiveView) {
+        let ActiveView::AgentThread { thread_view } = view else {
+            return;
+        };
+        self.pending_agent_session_ids_by_thread_view
+            .remove(&Entity::entity_id(thread_view));
     }
 
     fn inactive_tab_id_for_agent_thread_view(&self, thread_view_id: EntityId) -> Option<usize> {
@@ -1044,14 +1104,18 @@ impl AgentPanel {
                 .iter()
                 .position(|tab| tab.id == tab_id)
             {
-                self.inactive_thread_tabs.remove(index);
+                let closed_tab = self.inactive_thread_tabs.remove(index);
+                self.clear_pending_session_id_for_view(&closed_tab.view);
                 self.serialize(cx);
                 cx.notify();
             }
             return;
         }
 
-        let _closed_tab = self.take_current_thread_view();
+        let closed_tab = self.take_current_thread_view();
+        if let Some(closed_tab) = closed_tab.as_ref() {
+            self.clear_pending_session_id_for_view(closed_tab);
+        }
         let next_tab_index = self
             .inactive_thread_tabs
             .iter()
@@ -2356,6 +2420,11 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(thread_view_id) = self.thread_view_id_for_session(&thread.session_id, cx) {
+            self.focus_thread_view_from_notification(thread_view_id, window, cx);
+            return;
+        }
+
         let Some(agent) = self.selected_external_agent(cx) else {
             return;
         };
@@ -2387,6 +2456,10 @@ impl AgentPanel {
             self.begin_new_thread_tab();
         }
 
+        let pending_session_id = resume_thread
+            .as_ref()
+            .map(|resume_thread| resume_thread.session_id.clone());
+
         let selected_agent = AgentType::from(ext_agent);
         if self.selected_agent != selected_agent {
             self.selected_agent = selected_agent;
@@ -2412,6 +2485,13 @@ impl AgentPanel {
                 cx,
             )
         });
+        let thread_view_id = Entity::entity_id(&thread_view);
+        self.pending_agent_session_ids_by_thread_view
+            .remove(&thread_view_id);
+        if let Some(session_id) = pending_session_id {
+            self.pending_agent_session_ids_by_thread_view
+                .insert(thread_view_id, session_id);
+        }
 
         self.set_active_view(ActiveView::AgentThread { thread_view }, true, window, cx);
         if open_in_editor_tab {
@@ -4370,5 +4450,97 @@ mod tests {
         });
 
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_reopening_same_agent_session_does_not_create_duplicate_tab(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread_in_new_tab(
+                AgentSessionInfo {
+                    session_id: session_id.clone(),
+                    cwd: None,
+                    title: None,
+                    updated_at: None,
+                    meta: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.inactive_thread_tabs.len(),
+                0,
+                "reopening an already-open session should focus that tab rather than creating a duplicate",
+            );
+            let reopened_session_id = panel
+                .active_agent_thread(cx)
+                .expect("expected an active agent thread after reopening")
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                reopened_session_id, session_id,
+                "active session should remain unchanged when reopening the same session",
+            );
+        });
     }
 }
