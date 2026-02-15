@@ -904,18 +904,6 @@ impl AgentPanel {
         }
     }
 
-    fn thread_tab_title_for_view(view: &ActiveView, cx: &App) -> Option<SharedString> {
-        match view {
-            ActiveView::AgentThread { thread_view } => Some(thread_view.read(cx).title(cx)),
-            ActiveView::TextThread {
-                text_thread_editor, ..
-            } => Some(text_thread_editor.read(cx).title(cx).into()),
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
-                None
-            }
-        }
-    }
-
     fn thread_tab_is_loading(view: &ActiveView, cx: &App) -> bool {
         match view {
             ActiveView::AgentThread { thread_view } => thread_view.read(cx).is_loading(),
@@ -3093,6 +3081,7 @@ impl AgentPanel {
         };
 
         let show_history_menu = self.history_kind_for_selected_agent(cx).is_some();
+        let toolbar_tabs = self.render_thread_tabs(cx);
 
         h_flex()
             .id("agent-panel-toolbar")
@@ -3104,7 +3093,14 @@ impl AgentPanel {
             .bg(cx.theme().colors().tab_bar_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
+            .child(if let Some(toolbar_tabs) = toolbar_tabs {
+                h_flex()
+                    .size_full()
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .pl(DynamicSpacing::Base04.rems(cx))
+                    .child(toolbar_tabs)
+                    .into_any_element()
+            } else {
                 h_flex()
                     .size_full()
                     .gap(DynamicSpacing::Base04.rems(cx))
@@ -3115,8 +3111,9 @@ impl AgentPanel {
                         }
                         _ => selected_agent.into_any_element(),
                     })
-                    .child(self.render_title_view(window, cx)),
-            )
+                    .child(self.render_title_view(window, cx))
+                    .into_any_element()
+            })
             .child(
                 h_flex()
                     .flex_none()
@@ -3138,27 +3135,31 @@ impl AgentPanel {
     fn render_thread_tabs(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         struct ThreadTabEntry {
             id: usize,
-            title: SharedString,
+            selected_agent: AgentType,
             loading: bool,
+        }
+
+        if !matches!(
+            self.active_view,
+            ActiveView::AgentThread { .. } | ActiveView::TextThread { .. }
+        ) {
+            return None;
         }
 
         let mut entries = self
             .inactive_thread_tabs
             .iter()
-            .filter_map(|tab| {
-                Self::thread_tab_title_for_view(&tab.view, cx).map(|title| ThreadTabEntry {
-                    id: tab.id,
-                    title,
-                    loading: Self::thread_tab_is_loading(&tab.view, cx),
-                })
+            .map(|tab| ThreadTabEntry {
+                id: tab.id,
+                selected_agent: tab.selected_agent.clone(),
+                loading: Self::thread_tab_is_loading(&tab.view, cx),
             })
             .collect::<Vec<_>>();
 
         let active_view = self.current_thread_view_for_tabs()?;
-        let active_title = Self::thread_tab_title_for_view(active_view, cx)?;
         entries.push(ThreadTabEntry {
             id: self.active_thread_tab_id,
-            title: active_title,
+            selected_agent: self.selected_agent.clone(),
             loading: Self::thread_tab_is_loading(active_view, cx),
         });
         entries.sort_by_key(|entry| entry.id);
@@ -3177,6 +3178,7 @@ impl AgentPanel {
             let tab_id = entry.id;
             let close_button =
                 IconButton::new(("close-agent-thread-tab", tab_id as u64), IconName::Close)
+                    .visible_on_hover("")
                     .shape(IconButtonShape::Square)
                     .size(ButtonSize::None)
                     .icon_size(IconSize::XSmall)
@@ -3202,12 +3204,21 @@ impl AgentPanel {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.activate_thread_tab(tab_id, window, cx);
                 }))
-                .start_slot::<AnyElement>(entry.loading.then(|| {
-                    Icon::new(IconName::ArrowCircle)
-                        .size(IconSize::XSmall)
-                        .into_any_element()
-                }))
-                .child(Label::new(entry.title).size(LabelSize::Small).truncate())
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .when_some(entry.selected_agent.icon(), |this, icon| {
+                            this.child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                        })
+                        .child(
+                            Label::new(entry.selected_agent.label())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .when(entry.loading, |this| {
+                            this.child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall))
+                        }),
+                )
                 .end_slot::<AnyElement>(Some(close_button.into_any_element()));
 
             tab_bar = tab_bar.child(tab);
@@ -3646,7 +3657,6 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
-            .children(self.render_thread_tabs(cx))
             .children(self.render_workspace_trust_message(cx))
             .children(self.render_onboarding(window, cx))
             .map(|parent| {
