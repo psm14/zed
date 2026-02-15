@@ -1121,6 +1121,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let open_in_new_tab = resume_thread.is_none();
         let workspace = self.workspace.clone();
         let project = self.project.clone();
         let fs = self.fs.clone();
@@ -1190,6 +1191,7 @@ impl AgentPanel {
                     workspace,
                     project,
                     selected_external_agent,
+                    open_in_new_tab,
                     window,
                     cx,
                 );
@@ -1286,7 +1288,7 @@ impl AgentPanel {
         cx.spawn_in(window, async move |this, cx| {
             let text_thread = text_thread_task.await?;
             this.update_in(cx, |this, window, cx| {
-                this.open_text_thread(text_thread, window, cx);
+                this.open_text_thread(text_thread, false, window, cx);
             })
         })
     }
@@ -1294,6 +1296,7 @@ impl AgentPanel {
     pub(crate) fn open_text_thread(
         &mut self,
         text_thread: Entity<TextThread>,
+        open_in_new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1312,7 +1315,9 @@ impl AgentPanel {
             )
         });
 
-        self.begin_new_thread_tab();
+        if open_in_new_tab {
+            self.begin_new_thread_tab();
+        }
 
         if self.selected_agent != AgentType::TextThread {
             self.selected_agent = AgentType::TextThread;
@@ -1514,18 +1519,25 @@ impl AgentPanel {
         };
 
         let thread_view_id = Entity::entity_id(&thread_view);
-        workspace.update(cx, |workspace, cx| {
+        let editor_tab_item = workspace.update(cx, |workspace, cx| {
             let existing_item = workspace
                 .items_of_type::<AgentThreadEditorTabItem>(cx)
                 .find(|item| item.read(cx).thread_view_id == thread_view_id);
             if let Some(existing_item) = existing_item {
                 workspace.activate_item(&existing_item, true, true, window, cx);
-                return;
+                return existing_item;
             }
 
             let item = cx.new(|cx| AgentThreadEditorTabItem::new(thread_view.clone(), cx));
             workspace.add_item_to_center(Box::new(item.clone()), window, cx);
             workspace.activate_item(&item, true, true, window, cx);
+            item
+        });
+
+        self.close_thread_tab(self.active_thread_tab_id, window, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.activate_item(&editor_tab_item, true, true, window, cx);
         });
     }
 
@@ -2191,10 +2203,13 @@ impl AgentPanel {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         ext_agent: ExternalAgent,
+        open_in_new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.begin_new_thread_tab();
+        if open_in_new_tab {
+            self.begin_new_thread_tab();
+        }
 
         let selected_agent = AgentType::from(ext_agent);
         if self.selected_agent != selected_agent {
@@ -3942,7 +3957,7 @@ impl AgentPanel {
         };
 
         self._external_thread(
-            server, None, None, workspace, project, ext_agent, window, cx,
+            server, None, None, workspace, project, ext_agent, true, window, cx,
         );
     }
 
