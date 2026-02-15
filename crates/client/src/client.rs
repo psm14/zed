@@ -649,6 +649,10 @@ impl Client {
         cx.update(|cx| ClientSettings::get_global(cx).trusted_collaboration_config())
     }
 
+    pub fn trusted_collaboration_enabled(&self, cx: &AsyncApp) -> bool {
+        self.trusted_collaboration_config(cx).is_some()
+    }
+
     fn credentials_match_trusted_collaboration_config(
         credentials: &Credentials,
         config: &TrustedCollaborationConfig,
