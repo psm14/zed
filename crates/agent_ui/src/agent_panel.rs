@@ -4065,7 +4065,11 @@ pub(crate) struct AgentThreadEditorTabItem {
 }
 
 impl AgentThreadEditorTabItem {
-    fn new(thread_view: Entity<AcpServerView>, selected_agent: AgentType, _cx: &mut App) -> Self {
+    pub(crate) fn new(
+        thread_view: Entity<AcpServerView>,
+        selected_agent: AgentType,
+        _cx: &mut App,
+    ) -> Self {
         Self {
             thread_view_id: Entity::entity_id(&thread_view),
             thread_view,
