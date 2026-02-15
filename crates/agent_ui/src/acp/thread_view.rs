@@ -239,6 +239,49 @@ impl AcpServerView {
         }
         cx.notify();
     }
+
+    pub fn open_session(
+        &mut self,
+        session: AgentSessionInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = session.session_id.clone();
+        if let Some(connected) = self.as_connected_mut()
+            && connected.threads.contains_key(&session_id)
+        {
+            connected.navigate_to_session(session_id);
+            if let Some(view) = self.active_thread() {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        let state = Self::initial_state(
+            self.agent.clone(),
+            Some(session),
+            self.project.clone(),
+            None,
+            window,
+            cx,
+        );
+        self.set_server_state(state, cx);
+
+        if let Some(view) = self.active_thread() {
+            view.update(cx, |this, cx| {
+                this.message_editor.update(cx, |editor, cx| {
+                    editor.set_command_state(
+                        this.prompt_capabilities.clone(),
+                        this.available_commands.clone(),
+                        cx,
+                    );
+                });
+            });
+            view.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
 }
 
 enum ServerState {

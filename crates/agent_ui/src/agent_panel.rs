@@ -672,7 +672,7 @@ impl AgentPanel {
             window,
             |this, _, event, window, cx| match event {
                 ThreadHistoryEvent::Open(thread) => {
-                    this.load_agent_thread(thread.clone(), window, cx);
+                    this.load_agent_thread_in_new_tab(thread.clone(), window, cx);
                 }
             },
         )
@@ -682,7 +682,7 @@ impl AgentPanel {
             window,
             |this, _, event, window, cx| match event {
                 TextThreadHistoryEvent::Open(thread) => {
-                    this.open_saved_text_thread(thread.path.clone(), window, cx)
+                    this.open_saved_text_thread_in_new_tab(thread.path.clone(), window, cx)
                         .detach_and_log_err(cx);
                 }
             },
@@ -1109,7 +1109,26 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let open_in_new_tab = resume_thread.is_none();
+        self.external_thread_with_tab_mode(
+            agent_choice,
+            resume_thread,
+            initial_content,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn external_thread_with_tab_mode(
+        &mut self,
+        agent_choice: Option<crate::ExternalAgent>,
+        resume_thread: Option<AgentSessionInfo>,
+        initial_content: Option<ExternalAgentInitialContent>,
+        open_in_new_tab_override: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open_in_new_tab = open_in_new_tab_override.unwrap_or(resume_thread.is_none());
         let workspace = self.workspace.clone();
         let project = self.project.clone();
         let fs = self.fs.clone();
@@ -1264,9 +1283,10 @@ impl AgentPanel {
         cx.notify();
     }
 
-    pub(crate) fn open_saved_text_thread(
+    fn open_saved_text_thread_with_tab_mode(
         &mut self,
         path: Arc<Path>,
+        open_in_new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
@@ -1276,9 +1296,27 @@ impl AgentPanel {
         cx.spawn_in(window, async move |this, cx| {
             let text_thread = text_thread_task.await?;
             this.update_in(cx, |this, window, cx| {
-                this.open_text_thread(text_thread, false, window, cx);
+                this.open_text_thread(text_thread, open_in_new_tab, window, cx);
             })
         })
+    }
+
+    pub(crate) fn open_saved_text_thread(
+        &mut self,
+        path: Arc<Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.open_saved_text_thread_with_tab_mode(path, false, window, cx)
+    }
+
+    pub(crate) fn open_saved_text_thread_in_new_tab(
+        &mut self,
+        path: Arc<Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.open_saved_text_thread_with_tab_mode(path, true, window, cx)
     }
 
     pub(crate) fn open_text_thread(
@@ -1516,7 +1554,9 @@ impl AgentPanel {
                 return existing_item;
             }
 
-            let item = cx.new(|cx| AgentThreadEditorTabItem::new(thread_view.clone(), cx));
+            let selected_agent = self.selected_agent.clone();
+            let item =
+                cx.new(|cx| AgentThreadEditorTabItem::new(thread_view.clone(), selected_agent, cx));
             workspace.add_item_to_center(Box::new(item.clone()), window, cx);
             workspace.activate_item(&item, true, true, window, cx);
             item
@@ -1877,7 +1917,7 @@ impl AgentPanel {
                             let entry = entry.clone();
                             panel
                                 .update(cx, move |this, cx| {
-                                    this.load_agent_thread(entry.clone(), window, cx);
+                                    this.load_agent_thread_in_new_tab(entry.clone(), window, cx);
                                 })
                                 .ok();
                         }
@@ -1914,8 +1954,12 @@ impl AgentPanel {
                             let path = entry.path.clone();
                             panel
                                 .update(cx, move |this, cx| {
-                                    this.open_saved_text_thread(path.clone(), window, cx)
-                                        .detach_and_log_err(cx);
+                                    this.open_saved_text_thread_in_new_tab(
+                                        path.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
                                 })
                                 .ok();
                         }
@@ -2181,6 +2225,18 @@ impl AgentPanel {
             return;
         };
         self.external_thread(Some(agent), Some(thread), None, window, cx);
+    }
+
+    pub fn load_agent_thread_in_new_tab(
+        &mut self,
+        thread: AgentSessionInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.selected_external_agent(cx) else {
+            return;
+        };
+        self.external_thread_with_tab_mode(Some(agent), Some(thread), None, Some(true), window, cx);
     }
 
     fn _external_thread(
@@ -2602,12 +2658,6 @@ impl AgentPanel {
                             }
                         }
 
-                        if thread_view.is_some() {
-                            menu = menu
-                                .action("Open in Editor Tab", Box::new(OpenActiveThreadInEditorTab))
-                                .separator();
-                        }
-
                         menu = menu
                             .header("MCP Servers")
                             .action(
@@ -2626,6 +2676,13 @@ impl AgentPanel {
                             .action("Settings", Box::new(OpenSettings))
                             .separator()
                             .action(full_screen_label, Box::new(ToggleZoom));
+
+                        if thread_view.is_some() {
+                            menu = menu.action(
+                                "Open in Editor Tab",
+                                Box::new(OpenActiveThreadInEditorTab),
+                            );
+                        }
 
                         if selected_agent == AgentType::Gemini {
                             menu = menu.action("Reauthenticate", Box::new(ReauthenticateAgent))
@@ -3728,13 +3785,15 @@ impl Render for AgentPanel {
 struct AgentThreadEditorTabItem {
     thread_view: Entity<AcpServerView>,
     thread_view_id: EntityId,
+    selected_agent: AgentType,
 }
 
 impl AgentThreadEditorTabItem {
-    fn new(thread_view: Entity<AcpServerView>, _cx: &mut App) -> Self {
+    fn new(thread_view: Entity<AcpServerView>, selected_agent: AgentType, _cx: &mut App) -> Self {
         Self {
             thread_view_id: Entity::entity_id(&thread_view),
             thread_view,
+            selected_agent,
         }
     }
 }
@@ -3750,12 +3809,16 @@ impl Focusable for AgentThreadEditorTabItem {
 impl Item for AgentThreadEditorTabItem {
     type Event = ();
 
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        self.thread_view.read(cx).title(cx)
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.selected_agent.label()
     }
 
-    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        Some(self.thread_view.read(cx).title(cx))
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        self.selected_agent.icon().map(Icon::new)
+    }
+
+    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
+        Some(self.selected_agent.label())
     }
 
     fn include_in_nav_history() -> bool {
