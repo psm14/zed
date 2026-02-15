@@ -960,6 +960,61 @@ impl AgentPanel {
             .remove(&Entity::entity_id(thread_view));
     }
 
+    fn text_thread_entity_id_for_view(&self, view: &ActiveView, cx: &App) -> Option<EntityId> {
+        let ActiveView::TextThread {
+            text_thread_editor, ..
+        } = view
+        else {
+            return None;
+        };
+
+        Some(Entity::entity_id(text_thread_editor.read(cx).text_thread()))
+    }
+
+    fn thread_tab_id_for_text_thread_entity(
+        &self,
+        text_thread_entity_id: EntityId,
+        cx: &App,
+    ) -> Option<usize> {
+        if let Some(current_view) = self.current_thread_view_for_tabs()
+            && self
+                .text_thread_entity_id_for_view(current_view, cx)
+                .is_some_and(|candidate_id| candidate_id == text_thread_entity_id)
+        {
+            return Some(self.active_thread_tab_id);
+        }
+
+        self.inactive_thread_tabs.iter().find_map(|tab| {
+            self.text_thread_entity_id_for_view(&tab.view, cx)
+                .filter(|candidate_id| *candidate_id == text_thread_entity_id)
+                .map(|_| tab.id)
+        })
+    }
+
+    fn focus_thread_tab_for_existing_tab(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_id != self.active_thread_tab_id {
+            self.activate_thread_tab(tab_id, window, cx);
+            return;
+        }
+
+        if matches!(
+            self.active_view,
+            ActiveView::History { .. } | ActiveView::Configuration
+        ) && let Some(previous_view) = self.previous_view.take()
+        {
+            if Self::is_thread_view(&previous_view) {
+                self.set_active_view(previous_view, true, window, cx);
+            } else {
+                self.previous_view = Some(previous_view);
+            }
+        }
+    }
+
     fn inactive_tab_id_for_agent_thread_view(&self, thread_view_id: EntityId) -> Option<usize> {
         self.inactive_thread_tabs.iter().find_map(|tab| {
             Self::agent_thread_view_id(&tab.view)
@@ -1513,6 +1568,12 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let text_thread_entity_id = Entity::entity_id(&text_thread);
+        if let Some(tab_id) = self.thread_tab_id_for_text_thread_entity(text_thread_entity_id, cx) {
+            self.focus_thread_tab_for_existing_tab(tab_id, window, cx);
+            return;
+        }
+
         let lsp_adapter_delegate = make_lsp_adapter_delegate(&self.project.clone(), cx)
             .log_err()
             .flatten();
@@ -4540,6 +4601,79 @@ mod tests {
             assert_eq!(
                 reopened_session_id, session_id,
                 "active session should remain unchanged when reopening the same session",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reopening_same_text_thread_does_not_create_duplicate_tab(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let text_thread = panel.update(cx, |panel, cx| {
+            panel
+                .text_thread_store
+                .update(cx, |store, cx| store.create(cx))
+        });
+        let text_thread_entity_id = Entity::entity_id(&text_thread);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_text_thread(text_thread.clone(), true, window, cx);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_text_thread(text_thread.clone(), true, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.inactive_thread_tabs.len(),
+                0,
+                "reopening an already-open text thread should focus that tab rather than creating a duplicate",
+            );
+
+            let active_text_thread_entity_id = panel
+                .active_text_thread_editor()
+                .map(|editor| Entity::entity_id(editor.read(cx).text_thread()))
+                .expect("expected an active text thread");
+            assert_eq!(
+                active_text_thread_entity_id, text_thread_entity_id,
+                "active text thread should remain unchanged when reopening the same thread",
             );
         });
     }
