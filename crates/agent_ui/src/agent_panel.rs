@@ -882,6 +882,59 @@ impl AgentPanel {
         }
     }
 
+    fn agent_thread_view_id(view: &ActiveView) -> Option<EntityId> {
+        match view {
+            ActiveView::AgentThread { thread_view } => Some(Entity::entity_id(thread_view)),
+            ActiveView::Uninitialized
+            | ActiveView::TextThread { .. }
+            | ActiveView::History { .. }
+            | ActiveView::Configuration => None,
+        }
+    }
+
+    fn inactive_tab_id_for_agent_thread_view(&self, thread_view_id: EntityId) -> Option<usize> {
+        self.inactive_thread_tabs.iter().find_map(|tab| {
+            Self::agent_thread_view_id(&tab.view)
+                .filter(|candidate_id| *candidate_id == thread_view_id)
+                .map(|_| tab.id)
+        })
+    }
+
+    pub(crate) fn focus_thread_view_from_notification(
+        &mut self,
+        thread_view_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab_id) = self.inactive_tab_id_for_agent_thread_view(thread_view_id) {
+            self.activate_thread_tab(tab_id, window, cx);
+            return;
+        }
+
+        let selected_tab_matches = self
+            .current_thread_view_for_tabs()
+            .and_then(Self::agent_thread_view_id)
+            .is_some_and(|candidate_id| candidate_id == thread_view_id);
+
+        if !selected_tab_matches {
+            return;
+        }
+
+        if matches!(
+            self.active_view,
+            ActiveView::History { .. } | ActiveView::Configuration
+        ) && let Some(previous_view) = self.previous_view.take()
+        {
+            if Self::agent_thread_view_id(&previous_view)
+                .is_some_and(|candidate_id| candidate_id == thread_view_id)
+            {
+                self.set_active_view(previous_view, true, window, cx);
+            } else {
+                self.previous_view = Some(previous_view);
+            }
+        }
+    }
+
     fn is_thread_view(view: &ActiveView) -> bool {
         matches!(
             view,
@@ -3782,7 +3835,7 @@ impl Render for AgentPanel {
     }
 }
 
-struct AgentThreadEditorTabItem {
+pub(crate) struct AgentThreadEditorTabItem {
     thread_view: Entity<AcpServerView>,
     thread_view_id: EntityId,
     selected_agent: AgentType,
@@ -3795,6 +3848,10 @@ impl AgentThreadEditorTabItem {
             thread_view,
             selected_agent,
         }
+    }
+
+    pub(crate) fn thread_view_id(&self) -> EntityId {
+        self.thread_view_id
     }
 }
 

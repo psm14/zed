@@ -71,6 +71,7 @@ use crate::acp::ModeSelector;
 use crate::acp::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::acp::message_editor::{MessageEditor, MessageEditorEvent};
 use crate::agent_diff::AgentDiff;
+use crate::agent_panel::AgentThreadEditorTabItem;
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
@@ -2289,6 +2290,7 @@ impl AcpServerView {
         cx: &mut Context<Self>,
     ) {
         let options = AgentNotification::window_options(screen, cx);
+        let thread_view_id = cx.entity_id();
 
         let project_name = self.workspace.upgrade().and_then(|workspace| {
             workspace
@@ -2313,7 +2315,7 @@ impl AcpServerView {
                 .entry(screen_window)
                 .or_insert_with(Vec::new)
                 .push(cx.subscribe_in(&pop_up, window, {
-                    |this, _, event, window, cx| match event {
+                    move |this, _, event, window, cx| match event {
                         AgentNotificationEvent::Accepted => {
                             let Some(handle) = window.window_handle().downcast::<MultiWorkspace>()
                             else {
@@ -2330,9 +2332,47 @@ impl AcpServerView {
                                         window.activate_window();
                                         if let Some(workspace) = workspace_handle.upgrade() {
                                             multi_workspace.activate(workspace.clone(), cx);
-                                            workspace.update(cx, |workspace, cx| {
-                                                workspace.focus_panel::<AgentPanel>(window, cx);
-                                            });
+
+                                            let focused_editor_item =
+                                                workspace.update(cx, |workspace, cx| {
+                                                    let editor_item = workspace
+                                                        .items_of_type::<AgentThreadEditorTabItem>(
+                                                            cx,
+                                                        )
+                                                        .find(|item| {
+                                                            item.read(cx).thread_view_id()
+                                                                == thread_view_id
+                                                        });
+                                                    if let Some(editor_item) = editor_item {
+                                                        workspace.activate_item(
+                                                            &editor_item,
+                                                            true,
+                                                            true,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                });
+
+                                            if !focused_editor_item {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    workspace.focus_panel::<AgentPanel>(window, cx);
+                                                    if let Some(panel) =
+                                                        workspace.panel::<AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.focus_thread_view_from_notification(
+                                                                thread_view_id,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
                                         }
                                     })
                                     .log_err();
