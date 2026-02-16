@@ -1,12 +1,13 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use agent_ui::AgentPanel;
 use call::{ActiveCall, ParticipantLocation, Room};
 use channel::ChannelStore;
 use client::{User, proto::PeerId};
 use gpui::{
-    AnyElement, Hsla, IntoElement, MouseButton, Path, ScreenCaptureSource, Styled, WeakEntity,
-    canvas, point,
+    AnyElement, Hsla, IntoElement, MouseButton, Path, ScreenCaptureSource, SharedString, Styled,
+    WeakEntity, canvas, point,
 };
 use gpui::{App, Task, Window};
 use project::WorktreeSettings;
@@ -18,7 +19,7 @@ use ui::{
     Facepile, PopoverMenu, SplitButton, SplitButtonStyle, TintColor, Tooltip, prelude::*,
 };
 use util::rel_path::RelPath;
-use workspace::notifications::DetachAndPromptErr;
+use workspace::{CollaboratorId, notifications::DetachAndPromptErr};
 
 use crate::TitleBar;
 
@@ -132,7 +133,7 @@ fn render_color_ribbon(color: Hsla) -> impl Element {
 impl TitleBar {
     pub(crate) fn render_collaborator_list(
         &self,
-        _: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let room = ActiveCall::global(cx).read(cx).room().cloned();
@@ -140,6 +141,16 @@ impl TitleBar {
         let client = self.client.clone();
         let project_id = self.project.read(cx).remote_id();
         let workspace = self.workspace.upgrade();
+        let is_following_agent = workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.read(cx).is_being_followed(CollaboratorId::Agent));
+        let agent_presences = workspace
+            .as_ref()
+            .and_then(|workspace| {
+                let agent_panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                Some(agent_panel.read(cx).collaboration_presences(cx))
+            })
+            .unwrap_or_default();
 
         h_flex()
             .id("collaborator-list")
@@ -234,6 +245,21 @@ impl TitleBar {
                     }))
                 },
             )
+            .children(
+                agent_presences
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, presence)| {
+                        self.render_agent_collaborator(
+                            index,
+                            presence.title,
+                            presence.status,
+                            is_following_agent,
+                            cx,
+                        )
+                        .into_any_element()
+                    }),
+            )
     }
 
     fn render_collaborator(
@@ -318,6 +344,77 @@ impl TitleBar {
                         }),
                 ),
         )
+    }
+
+    fn render_agent_collaborator(
+        &self,
+        chip_index: usize,
+        thread_title: SharedString,
+        status: SharedString,
+        is_following_agent: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let player_color = cx.theme().players().agent();
+        let tooltip_text = format!("Follow agent • {status}: {thread_title}");
+
+        v_flex()
+            .id(("collaborator-agent", chip_index))
+            .child(
+                div()
+                    .m_0p5()
+                    .p_0p5()
+                    .when(is_following_agent, |div| {
+                        div.rounded_sm().bg(player_color.selection)
+                    })
+                    .child(
+                        Facepile::empty().child(
+                            div()
+                                .w_6()
+                                .h_6()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().element_background)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::AiZed)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                    ),
+            )
+            .child(render_color_ribbon(player_color.cursor))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                window.prevent_default();
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, window, cx| {
+                    window.prevent_default();
+                    this.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        })
+                        .ok();
+                }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        if is_following_agent {
+                            workspace.unfollow(CollaboratorId::Agent, window, cx);
+                        } else {
+                            workspace.follow(CollaboratorId::Agent, window, cx);
+                        }
+                    })
+                    .ok();
+            }))
+            .tooltip(Tooltip::text(tooltip_text))
     }
 
     pub(crate) fn render_call_controls(

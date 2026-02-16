@@ -3,6 +3,7 @@ mod contact_finder;
 
 use self::channel_modal::ChannelModal;
 use crate::{CollaborationPanelSettings, channel_view::ChannelView};
+use agent_ui::AgentPanel;
 use anyhow::Context as _;
 use call::ActiveCall;
 use channel::{Channel, ChannelEvent, ChannelStore};
@@ -14,10 +15,10 @@ use editor::{Editor, EditorElement, EditorStyle};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     AnyElement, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent,
-    Div, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, InteractiveElement, IntoElement,
-    KeyContext, ListOffset, ListState, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
-    Render, SharedString, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
-    anchored, canvas, deferred, div, fill, list, point, prelude::*, px,
+    Div, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontStyle, InteractiveElement,
+    IntoElement, KeyContext, ListOffset, ListState, MouseDownEvent, ParentElement, Pixels, Point,
+    PromptLevel, Render, SharedString, Styled, Subscription, Task, TextStyle, WeakEntity, Window,
+    actions, anchored, canvas, deferred, div, fill, list, point, prelude::*, px,
 };
 use menu::{Cancel, Confirm, SecondaryConfirm, SelectNext, SelectPrevious};
 use project::{Fs, Project};
@@ -36,8 +37,8 @@ use ui::{
 };
 use util::{ResultExt, TryFutureExt, maybe};
 use workspace::{
-    CopyRoomId, Deafen, LeaveCall, MultiWorkspace, Mute, OpenChannelNotes, ScreenShare,
-    ShareProject, Workspace,
+    CollaboratorId, CopyRoomId, Deafen, LeaveCall, MultiWorkspace, Mute, OpenChannelNotes,
+    ScreenShare, ShareProject, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotifyResultExt},
 };
@@ -230,6 +231,8 @@ pub struct CollabPanel {
     project: Entity<Project>,
     match_candidates: Vec<StringMatchCandidate>,
     subscriptions: Vec<Subscription>,
+    agent_panel_subscription: Option<Subscription>,
+    observed_agent_panel_id: Option<EntityId>,
     collapsed_sections: Vec<Section>,
     collapsed_channels: Vec<ChannelId>,
     filter_active_channels: bool,
@@ -245,6 +248,7 @@ struct SerializedCollabPanel {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Section {
     ActiveCall,
+    Agents,
     Channels,
     ChannelInvites,
     ContactRequests,
@@ -256,6 +260,13 @@ enum Section {
 #[derive(Clone, Debug)]
 enum ListEntry {
     Header(Section),
+    Agent {
+        thread_view_id: EntityId,
+        session_id: Option<SharedString>,
+        title: SharedString,
+        status: SharedString,
+        file: Option<SharedString>,
+    },
     CallParticipant {
         user: Arc<User>,
         peer_id: Option<PeerId>,
@@ -402,6 +413,8 @@ impl CollabPanel {
                 user_store: workspace.user_store().clone(),
                 project: workspace.project().clone(),
                 subscriptions: Vec::default(),
+                agent_panel_subscription: None,
+                observed_agent_panel_id: None,
                 match_candidates: Vec::default(),
                 collapsed_sections: vec![Section::Offline],
                 collapsed_channels: Vec::default(),
@@ -409,8 +422,6 @@ impl CollabPanel {
                 workspace: workspace.weak_handle(),
                 client: workspace.app_state().client.clone(),
             };
-
-            this.update_entries(false, cx);
 
             let active_call = ActiveCall::global(cx);
             this.subscriptions
@@ -423,6 +434,23 @@ impl CollabPanel {
                 }));
             this.subscriptions
                 .push(cx.observe(&active_call, |this, _, cx| this.update_entries(true, cx)));
+            this.update_agent_panel_subscription(workspace.panel::<AgentPanel>(cx), cx);
+            if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+                this.subscriptions
+                    .push(cx.observe(&workspace_entity, |this, workspace, cx| {
+                        this.update_agent_panel_subscription(
+                            workspace.read(cx).panel::<AgentPanel>(cx),
+                            cx,
+                        );
+
+                        let collab_panel = cx.entity().downgrade();
+                        cx.defer(move |cx| {
+                            collab_panel
+                                .update(cx, |this, cx| this.update_entries(true, cx))
+                                .log_err();
+                        });
+                    }));
+            }
             this.subscriptions.push(cx.subscribe_in(
                 &this.channel_store,
                 window,
@@ -471,7 +499,7 @@ impl CollabPanel {
             None => None,
         };
 
-        workspace.update_in(&mut cx, |workspace, window, cx| {
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
             let panel = CollabPanel::new(workspace, window, cx);
             if let Some(serialized_panel) = serialized_panel {
                 panel.update(cx, |panel, cx| {
@@ -486,7 +514,11 @@ impl CollabPanel {
                 });
             }
             panel
-        })
+        })?;
+
+        panel.update(&mut cx, |panel, cx| panel.update_entries(false, cx));
+
+        Ok(panel)
     }
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
@@ -529,6 +561,25 @@ impl CollabPanel {
 
     fn scroll_to_item(&mut self, ix: usize) {
         self.list_state.scroll_to_reveal_item(ix)
+    }
+
+    fn update_agent_panel_subscription(
+        &mut self,
+        agent_panel: Option<Entity<AgentPanel>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let agent_panel_id = agent_panel.as_ref().map(Entity::entity_id);
+        if self.observed_agent_panel_id == agent_panel_id {
+            return false;
+        }
+
+        self.observed_agent_panel_id = agent_panel_id;
+        self.agent_panel_subscription = agent_panel.map(|agent_panel| {
+            cx.observe(&agent_panel, |this, _, cx| {
+                this.update_entries(true, cx);
+            })
+        });
+        true
     }
 
     fn update_entries(&mut self, select_same_item: bool, cx: &mut Context<Self>) {
@@ -678,6 +729,45 @@ impl CollabPanel {
                         role: proto::ChannelRole::Member,
                     }));
             }
+        }
+
+        let agent_presences = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| {
+                let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                Some(panel.read(cx).collaboration_presences(cx))
+            })
+            .unwrap_or_default();
+        if !agent_presences.is_empty() {
+            self.entries.push(ListEntry::Header(Section::Agents));
+
+            let normalized_query = query.to_lowercase();
+            let filtered_presences = agent_presences.into_iter().filter(|presence| {
+                query.is_empty()
+                    || presence
+                        .title
+                        .as_ref()
+                        .to_lowercase()
+                        .contains(&normalized_query)
+                    || presence
+                        .status
+                        .as_ref()
+                        .to_lowercase()
+                        .contains(&normalized_query)
+                    || presence.file.as_ref().is_some_and(|file| {
+                        file.as_ref().to_lowercase().contains(&normalized_query)
+                    })
+            });
+
+            self.entries
+                .extend(filtered_presences.map(|presence| ListEntry::Agent {
+                    thread_view_id: presence.thread_view_id,
+                    session_id: presence.session_id,
+                    title: presence.title,
+                    status: presence.status,
+                    file: presence.file,
+                }));
         }
 
         let mut request_entries = Vec::new();
@@ -1072,6 +1162,102 @@ impl CollabPanel {
                     },
                 ))
             })
+    }
+
+    fn render_agent(
+        &self,
+        thread_view_id: EntityId,
+        session_id: Option<&SharedString>,
+        title: &SharedString,
+        status: &SharedString,
+        file: Option<&SharedString>,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> ListItem {
+        let session_id = session_id.cloned();
+        ListItem::new(("agent", thread_view_id.as_u64() as usize))
+            .toggle_state(is_selected)
+            .start_slot(
+                Icon::new(IconName::AiZed)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .child(Label::new(title.clone()))
+                    .child(
+                        Label::new(status.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when_some(file, |this, file| {
+                        this.child(
+                            Label::new(file.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .end_slot(
+                IconButton::new(
+                    ("open-agent-thread", thread_view_id.as_u64()),
+                    IconName::ArrowUpRight,
+                )
+                .shape(IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_agent_thread(thread_view_id, session_id.clone(), window, cx);
+                }))
+                .tooltip(Tooltip::text("Open Agent Thread"))
+                .into_any_element(),
+            )
+            .tooltip(Tooltip::text(format!("Follow agent • {status}: {title}")))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.follow_agent(window, cx);
+            }))
+    }
+
+    fn follow_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.follow(CollaboratorId::Agent, window, cx);
+            })
+            .ok();
+    }
+
+    fn open_agent_thread(
+        &mut self,
+        thread_view_id: EntityId,
+        session_id: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            let panel = workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                .log_err()
+                .flatten();
+            if let Some(panel) = panel {
+                let focused_editor = panel.update(cx, |panel, cx| {
+                    panel.focus_collaboration_thread(
+                        thread_view_id,
+                        session_id.as_deref().map(AsRef::as_ref),
+                        window,
+                        cx,
+                    )
+                });
+                if focused_editor == Some(false) {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        })
+                        .log_err();
+                }
+            }
+        });
     }
 
     fn render_participant_project(
@@ -1630,6 +1816,7 @@ impl CollabPanel {
             match entry {
                 ListEntry::Header(section) => match section {
                     Section::ActiveCall => Self::leave_call(window, cx),
+                    Section::Agents => {}
                     Section::Channels => self.new_root_channel(window, cx),
                     Section::Contacts => self.toggle_contact_finder(window, cx),
                     Section::ContactRequests
@@ -1697,6 +1884,7 @@ impl CollabPanel {
                             .ok();
                     }
                 }
+                ListEntry::Agent { .. } => self.follow_agent(window, cx),
                 ListEntry::IncomingRequest(user) => {
                     self.respond_to_contact_request(user.id, true, window, cx)
                 }
@@ -2492,6 +2680,23 @@ impl CollabPanel {
                 self.render_header(*section, is_selected, is_collapsed, cx)
                     .into_any_element()
             }
+            ListEntry::Agent {
+                thread_view_id,
+                session_id,
+                title,
+                status,
+                file,
+            } => self
+                .render_agent(
+                    *thread_view_id,
+                    session_id.as_ref(),
+                    title,
+                    status,
+                    file.as_ref(),
+                    is_selected,
+                    cx,
+                )
+                .into_any_element(),
             ListEntry::Contact { contact, calling } => self
                 .render_contact(contact, *calling, is_selected, cx)
                 .into_any_element(),
@@ -2696,6 +2901,7 @@ impl CollabPanel {
                     SharedString::from("Current Call")
                 }
             }
+            Section::Agents => SharedString::from("Agents"),
             Section::ContactRequests => SharedString::from("Requests"),
             Section::Contacts => SharedString::from("Contacts"),
             Section::Channels => SharedString::from("Channels"),
@@ -2753,7 +2959,7 @@ impl CollabPanel {
         };
 
         let can_collapse = match section {
-            Section::ActiveCall | Section::Channels | Section::Contacts => false,
+            Section::ActiveCall | Section::Agents | Section::Channels | Section::Contacts => false,
             Section::ChannelInvites
             | Section::ContactRequests
             | Section::Online
@@ -3360,6 +3566,18 @@ impl PartialEq for ListEntry {
             ListEntry::Header(section_1) => {
                 if let ListEntry::Header(section_2) = other {
                     return section_1 == section_2;
+                }
+            }
+            ListEntry::Agent {
+                thread_view_id: thread_view_id_1,
+                ..
+            } => {
+                if let ListEntry::Agent {
+                    thread_view_id: thread_view_id_2,
+                    ..
+                } = other
+                {
+                    return thread_view_id_1 == thread_view_id_2;
                 }
             }
             ListEntry::CallParticipant { user: user_1, .. } => {
