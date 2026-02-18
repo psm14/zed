@@ -1693,6 +1693,7 @@ impl AcpThread {
 
             this.update(cx, |this, cx| {
                 let project = this.project.clone();
+                let session_id = this.session_id().0.clone();
 
                 for location in resolved_locations.iter().flatten() {
                     this.shared_buffers
@@ -1705,7 +1706,7 @@ impl AcpThread {
                 if let Some(Some(location)) = resolved_locations.last() {
                     project.update(cx, |project, cx| {
                         let should_ignore = if let Some(agent_location) = project
-                            .agent_location()
+                            .agent_location_for_session(Some(session_id.as_ref()))
                             .filter(|agent_location| agent_location.buffer == location.buffer)
                         {
                             let snapshot = location.buffer.read(cx).snapshot();
@@ -1720,7 +1721,11 @@ impl AcpThread {
                             false
                         };
                         if !should_ignore {
-                            project.set_agent_location(Some(location.into()), cx);
+                            project.set_agent_location_for_session(
+                                Some(session_id.to_string()),
+                                Some(location.into()),
+                                cx,
+                            );
                         }
                     });
                 }
@@ -1968,8 +1973,10 @@ impl AcpThread {
                 .await?;
 
             this.update(cx, |this, cx| {
-                this.project
-                    .update(cx, |project, cx| project.set_agent_location(None, cx));
+                let session_id = this.session_id().0.clone();
+                this.project.update(cx, |project, cx| {
+                    project.set_agent_location_for_session(Some(session_id.to_string()), None, cx)
+                });
                 let Ok(response) = response else {
                     // tx dropped, just return
                     return Ok(None);
@@ -2241,6 +2248,7 @@ impl AcpThread {
         let limit = limit.unwrap_or(u32::MAX);
         let project = self.project.clone();
         let action_log = self.action_log.clone();
+        let session_id = self.session_id().0.clone();
         cx.spawn(async move |this, cx| {
             let load = project.update(cx, |project, cx| {
                 let path = project
@@ -2292,7 +2300,8 @@ impl AcpThread {
             let end = snapshot.anchor_before(Point::new(line.saturating_add(limit), 0));
 
             project.update(cx, |project, cx| {
-                project.set_agent_location(
+                project.set_agent_location_for_session(
+                    Some(session_id.to_string()),
                     Some(AgentLocation {
                         buffer: buffer.downgrade(),
                         position: start,
@@ -2313,6 +2322,7 @@ impl AcpThread {
     ) -> Task<Result<()>> {
         let project = self.project.clone();
         let action_log = self.action_log.clone();
+        let session_id = self.session_id().0.clone();
         cx.spawn(async move |this, cx| {
             let load = project.update(cx, |project, cx| {
                 let path = project
@@ -2341,7 +2351,8 @@ impl AcpThread {
                 .await;
 
             project.update(cx, |project, cx| {
-                project.set_agent_location(
+                project.set_agent_location_for_session(
+                    Some(session_id.to_string()),
                     Some(AgentLocation {
                         buffer: buffer.downgrade(),
                         position: edits

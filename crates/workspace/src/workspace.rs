@@ -1297,6 +1297,7 @@ pub struct FollowerState {
     center_pane: Entity<Pane>,
     dock_pane: Option<Entity<Pane>>,
     active_view_id: Option<ViewId>,
+    agent_session_id: Option<SharedString>,
     items_by_leader_view_id: HashMap<ViewId, FollowerView>,
 }
 
@@ -4937,6 +4938,7 @@ impl Workspace {
                 center_pane: pane.clone(),
                 dock_pane: None,
                 active_view_id: None,
+                agent_session_id: None,
                 items_by_leader_view_id: Default::default(),
             },
         );
@@ -5081,6 +5083,49 @@ impl Workspace {
         }
     }
 
+    pub fn follow_agent_session(
+        &mut self,
+        session_id: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_session_id = session_id.as_ref().map(|session_id| session_id.as_ref());
+        if self
+            .follower_states
+            .get(&CollaboratorId::Agent)
+            .and_then(|state| {
+                state
+                    .agent_session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_ref())
+            })
+            == target_session_id
+        {
+            if let Some(follower_state) = self.follower_states.get(&CollaboratorId::Agent) {
+                window.focus(&follower_state.pane().focus_handle(cx), cx);
+            }
+            return;
+        }
+
+        if !self.follower_states.contains_key(&CollaboratorId::Agent)
+            && let Some(task) = self.start_following(CollaboratorId::Agent, window, cx)
+        {
+            task.detach_and_log_err(cx);
+        }
+
+        if let Some(follower_state) = self.follower_states.get_mut(&CollaboratorId::Agent) {
+            follower_state.agent_session_id = session_id;
+        } else {
+            return;
+        }
+
+        self.handle_agent_location_changed(window, cx);
+
+        if let Some(follower_state) = self.follower_states.get(&CollaboratorId::Agent) {
+            window.focus(&follower_state.pane().focus_handle(cx), cx);
+        }
+    }
+
     pub fn unfollow(
         &mut self,
         leader_id: impl Into<CollaboratorId>,
@@ -5113,6 +5158,22 @@ impl Workspace {
 
     pub fn is_being_followed(&self, id: impl Into<CollaboratorId>) -> bool {
         self.follower_states.contains_key(&id.into())
+    }
+
+    pub fn is_following_agent_session(&self, session_id: Option<&str>) -> bool {
+        let Some(follower_state) = self.follower_states.get(&CollaboratorId::Agent) else {
+            return false;
+        };
+
+        if session_id.is_none() {
+            return true;
+        }
+
+        follower_state
+            .agent_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_ref())
+            == session_id
     }
 
     fn active_item_path_changed(
@@ -5509,7 +5570,15 @@ impl Workspace {
             return;
         };
 
-        if let Some(agent_location) = self.project.read(cx).agent_location() {
+        let followed_session_id = follower_state
+            .agent_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_ref());
+        if let Some(agent_location) = self
+            .project
+            .read(cx)
+            .agent_location_for_session(followed_session_id)
+        {
             let buffer_entity_id = agent_location.buffer.entity_id();
             let view_id = ViewId {
                 creator: CollaboratorId::Agent,

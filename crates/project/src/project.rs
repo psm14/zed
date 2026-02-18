@@ -241,6 +241,7 @@ pub struct Project {
     settings_observer: Entity<SettingsObserver>,
     toolchain_store: Option<Entity<ToolchainStore>>,
     agent_location: Option<AgentLocation>,
+    agent_locations_by_session_id: HashMap<String, AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
 }
 
@@ -1331,6 +1332,7 @@ impl Project {
                 toolchain_store: Some(toolchain_store),
 
                 agent_location: None,
+                agent_locations_by_session_id: Default::default(),
                 downloading_files: Default::default(),
             }
         })
@@ -1562,6 +1564,7 @@ impl Project {
 
                 toolchain_store: Some(toolchain_store),
                 agent_location: None,
+                agent_locations_by_session_id: Default::default(),
                 downloading_files: Default::default(),
             };
 
@@ -1838,6 +1841,7 @@ impl Project {
                 remotely_created_models: Arc::new(Mutex::new(RemotelyCreatedModels::default())),
                 toolchain_store: None,
                 agent_location: None,
+                agent_locations_by_session_id: Default::default(),
                 downloading_files: Default::default(),
             };
             project.set_role(role, cx);
@@ -5909,8 +5913,34 @@ impl Project {
         cx.emit(Event::AgentLocationChanged);
     }
 
+    pub fn set_agent_location_for_session(
+        &mut self,
+        session_id: Option<String>,
+        new_location: Option<AgentLocation>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session_id) = session_id {
+            if let Some(location) = new_location.clone() {
+                self.agent_locations_by_session_id
+                    .insert(session_id, location);
+            } else {
+                self.agent_locations_by_session_id.remove(&session_id);
+            }
+        }
+
+        self.set_agent_location(new_location, cx);
+    }
+
     pub fn agent_location(&self) -> Option<AgentLocation> {
         self.agent_location.clone()
+    }
+
+    pub fn agent_location_for_session(&self, session_id: Option<&str>) -> Option<AgentLocation> {
+        if let Some(session_id) = session_id {
+            return self.agent_locations_by_session_id.get(session_id).cloned();
+        }
+
+        self.agent_location()
     }
 
     pub fn path_style(&self, cx: &App) -> PathStyle {

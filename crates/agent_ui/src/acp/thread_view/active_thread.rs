@@ -715,9 +715,10 @@ impl AcpThreadView {
         self.editing_message.take();
 
         if self.should_be_following {
+            let session_id = self.thread_session_id(cx);
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
+                    workspace.follow_agent_session(Some(session_id.clone()), window, cx);
                 })
                 .ok();
         }
@@ -748,6 +749,7 @@ impl AcpThreadView {
         cx: &mut Context<Self>,
     ) {
         let session_id = self.thread.read(cx).session_id().clone();
+        let session_id_for_follow_state = session_id.clone();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
         let thread = self.thread.downgrade();
 
@@ -840,7 +842,9 @@ impl AcpThreadView {
                     let should_be_following = this
                         .workspace
                         .update(cx, |workspace, _| {
-                            workspace.is_being_followed(CollaboratorId::Agent)
+                            workspace.is_following_agent_session(Some(
+                                session_id_for_follow_state.0.as_ref(),
+                            ))
                         })
                         .unwrap_or_default();
                     this.should_be_following = should_be_following;
@@ -1132,6 +1136,7 @@ impl AcpThreadView {
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
         let workspace = self.workspace.clone();
+        let session_id = self.thread_session_id(cx);
 
         let should_be_following = self.should_be_following;
         let contents_task = cx.spawn_in(window, async move |_this, cx| {
@@ -1139,7 +1144,7 @@ impl AcpThreadView {
             if should_be_following {
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.follow(CollaboratorId::Agent, window, cx);
+                        workspace.follow_agent_session(Some(session_id.clone()), window, cx);
                     })
                     .ok();
             }
@@ -1266,9 +1271,10 @@ impl AcpThreadView {
             thread.authorize_tool_call(tool_call_id, option_id, option_kind, cx);
         });
         if self.should_be_following {
+            let session_id = self.thread_session_id(cx);
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
+                    workspace.follow_agent_session(Some(session_id.clone()), window, cx);
                 })
                 .ok();
         }
@@ -1607,12 +1613,17 @@ impl AcpThreadView {
         cx.notify();
     }
 
+    fn thread_session_id(&self, cx: &App) -> SharedString {
+        SharedString::from(self.thread.read(cx).session_id().0.clone())
+    }
+
     fn is_following(&self, cx: &App) -> bool {
+        let session_id = self.thread_session_id(cx);
         match self.thread.read(cx).status() {
             ThreadStatus::Generating => self
                 .workspace
                 .read_with(cx, |workspace, _| {
-                    workspace.is_being_followed(CollaboratorId::Agent)
+                    workspace.is_following_agent_session(Some(session_id.as_ref().as_ref()))
                 })
                 .unwrap_or(false),
             _ => self.should_be_following,
@@ -1624,12 +1635,13 @@ impl AcpThreadView {
 
         self.should_be_following = !following;
         if self.thread.read(cx).status() == ThreadStatus::Generating {
+            let session_id = self.thread_session_id(cx);
             self.workspace
                 .update(cx, |workspace, cx| {
                     if following {
                         workspace.unfollow(CollaboratorId::Agent, window, cx);
                     } else {
-                        workspace.follow(CollaboratorId::Agent, window, cx);
+                        workspace.follow_agent_session(Some(session_id.clone()), window, cx);
                     }
                 })
                 .ok();

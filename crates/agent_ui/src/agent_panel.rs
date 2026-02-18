@@ -1,10 +1,10 @@
 use std::{cmp::Ordering, ops::Range, path::Path, rc::Rc, sync::Arc, time::Duration};
 
-use acp_thread::{AcpThread, AgentSessionInfo, MentionUri};
+use acp_thread::{AcpThread, AgentSessionInfo, AgentThreadEntry, MentionUri};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol as acp;
 use agent_servers::AgentServer;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
 use project::{
     ExternalAgentServerName,
@@ -21,7 +21,7 @@ use crate::{
     LoadThreadFromClipboard, NewTextThread, NewThread, OpenActiveThreadAsMarkdown,
     OpenActiveThreadInEditorTab, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell,
     ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu,
-    acp::AcpServerView,
+    acp::{AcpServerView, ThreadViewStatus},
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     slash_command::SlashCommandCompletionProvider,
     text_thread_editor::{AgentPanelDelegate, TextThreadEditor, make_lsp_adapter_delegate},
@@ -55,20 +55,20 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, LanguageModelRegistry};
-use project::{Project, ProjectPath, Worktree};
+use project::{AgentLocation, Project, ProjectPath, Worktree};
 use prompt_store::{PromptBuilder, PromptStore, UserPromptId};
 use rules_library::{RulesLibrary, open_rules_library};
 use search::{BufferSearchBar, buffer_search};
 use settings::{Settings, SettingsStore, update_settings_file};
 use theme::ThemeSettings;
 use ui::{
-    Callout, ContextMenu, ContextMenuEntry, IconButtonShape, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, Tab, TabBar, TabPosition, Tooltip, prelude::*, utils::WithRemSize,
+    Callout, CommonAnimationExt, ContextMenu, ContextMenuEntry, IconButtonShape, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, Tab, TabBar, TabPosition, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, Item, ToggleZoom, ToolbarItemView, Workspace,
-    WorkspaceId,
+    DraggedSelection, DraggedTab, Item, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::{
@@ -211,7 +211,12 @@ pub fn init(cx: &mut App) {
                     }
                 })
                 .register_action(|workspace, _: &Follow, window, cx| {
-                    workspace.follow(CollaboratorId::Agent, window, cx);
+                    let session_id = workspace.panel::<AgentPanel>(cx).and_then(|panel| {
+                        panel.read(cx).active_agent_thread(cx).map(|thread| {
+                            SharedString::from(thread.read(cx).session_id().0.clone())
+                        })
+                    });
+                    workspace.follow_agent_session(session_id, window, cx);
                 })
                 .register_action(|workspace, _: &OpenAgentDiff, window, cx| {
                     let thread = workspace
@@ -540,7 +545,7 @@ pub struct AgentPanel {
     active_view: ActiveView,
     active_thread_tab_id: usize,
     inactive_thread_tabs: Vec<InactiveThreadTab>,
-    pending_agent_session_ids_by_thread_view: HashMap<EntityId, acp::SessionId>,
+    agent_session_ids_by_thread_view: HashMap<EntityId, acp::SessionId>,
     next_thread_tab_id: usize,
     previous_view: Option<ActiveView>,
     _active_view_observation: Option<Subscription>,
@@ -558,6 +563,17 @@ pub struct AgentPanel {
     selected_agent: AgentType,
     show_trust_workspace_message: bool,
     last_configuration_error_telemetry: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AgentCollaborationPresence {
+    pub thread_view_id: EntityId,
+    pub session_id: Option<SharedString>,
+    pub icon: Option<IconName>,
+    pub title: SharedString,
+    pub status: SharedString,
+    pub file: Option<SharedString>,
+    pub project_id: Option<u64>,
 }
 
 impl AgentPanel {
@@ -819,7 +835,7 @@ impl AgentPanel {
             active_view,
             active_thread_tab_id: 0,
             inactive_thread_tabs: Vec::new(),
-            pending_agent_session_ids_by_thread_view: HashMap::default(),
+            agent_session_ids_by_thread_view: HashMap::default(),
             next_thread_tab_id: 1,
             workspace,
             user_store,
@@ -949,7 +965,7 @@ impl AgentPanel {
 
     fn agent_thread_view_id(view: &ActiveView) -> Option<EntityId> {
         match view {
-            ActiveView::AgentThread { thread_view } => Some(Entity::entity_id(thread_view)),
+            ActiveView::AgentThread { server_view } => Some(Entity::entity_id(server_view)),
             ActiveView::Uninitialized
             | ActiveView::TextThread { .. }
             | ActiveView::History { .. }
@@ -962,56 +978,146 @@ impl AgentPanel {
         thread_view: &Entity<AcpServerView>,
         cx: &App,
     ) -> Option<acp::SessionId> {
-        thread_view
-            .read(cx)
-            .active_thread()
-            .map(|active_thread| active_thread.read(cx).thread.read(cx).session_id().clone())
+        self.agent_session_ids_by_thread_view
+            .get(&Entity::entity_id(thread_view))
+            .cloned()
             .or_else(|| {
-                self.pending_agent_session_ids_by_thread_view
-                    .get(&Entity::entity_id(thread_view))
-                    .cloned()
+                thread_view.read(cx).active_thread().map(|active_thread| {
+                    active_thread.read(cx).thread.read(cx).session_id().clone()
+                })
             })
     }
 
-    fn agent_thread_session_id_for_view(
-        &self,
-        view: &ActiveView,
-        cx: &App,
-    ) -> Option<acp::SessionId> {
-        let ActiveView::AgentThread { thread_view } = view else {
-            return None;
-        };
-        self.agent_thread_session_id(thread_view, cx)
+    fn live_agent_thread_views(&self, cx: &App) -> HashMap<EntityId, Entity<AcpServerView>> {
+        let mut live_thread_views = HashMap::default();
+        if let Some(current_view) = self.current_thread_view_for_tabs()
+            && let ActiveView::AgentThread { server_view } = current_view
+        {
+            live_thread_views.insert(Entity::entity_id(server_view), server_view.clone());
+        }
+        for tab in &self.inactive_thread_tabs {
+            if let ActiveView::AgentThread { server_view } = &tab.view {
+                live_thread_views.insert(Entity::entity_id(server_view), server_view.clone());
+            }
+        }
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            for item in workspace
+                .read(cx)
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+            {
+                let item = item.read(cx);
+                live_thread_views.insert(item.thread_view_id(), item.thread_view.clone());
+            }
+        }
+
+        live_thread_views
+    }
+
+    fn ensure_tracked_agent_session_ids(&mut self, cx: &App) {
+        let live_thread_views = self.live_agent_thread_views(cx);
+
+        self.agent_session_ids_by_thread_view
+            .retain(|thread_view_id, _| live_thread_views.contains_key(thread_view_id));
+
+        for (thread_view_id, thread_view) in live_thread_views {
+            if self
+                .agent_session_ids_by_thread_view
+                .contains_key(&thread_view_id)
+            {
+                continue;
+            }
+
+            if let Some(session_id) = thread_view
+                .read(cx)
+                .active_thread()
+                .map(|active_thread| active_thread.read(cx).thread.read(cx).session_id().clone())
+            {
+                self.agent_session_ids_by_thread_view
+                    .insert(thread_view_id, session_id);
+            }
+        }
+    }
+
+    fn open_agent_session_ids(&self, cx: &App) -> HashSet<acp::SessionId> {
+        self.live_agent_thread_views(cx)
+            .into_iter()
+            .flat_map(|(thread_view_id, thread_view)| {
+                self.agent_session_ids_by_thread_view
+                    .get(&thread_view_id)
+                    .cloned()
+                    .into_iter()
+                    .chain(
+                        thread_view
+                            .read(cx)
+                            .active_thread()
+                            .map(|active_thread| {
+                                active_thread.read(cx).thread.read(cx).session_id().clone()
+                            })
+                            .into_iter(),
+                    )
+            })
+            .collect()
     }
 
     fn thread_view_id_for_session(
-        &self,
+        &mut self,
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Option<EntityId> {
-        if let Some(current_view) = self.current_thread_view_for_tabs()
-            && self
-                .agent_thread_session_id_for_view(current_view, cx)
-                .as_ref()
-                .is_some_and(|candidate_session_id| candidate_session_id == session_id)
-        {
-            return Self::agent_thread_view_id(current_view);
+        self.ensure_tracked_agent_session_ids(cx);
+
+        if let Some(thread_view_id) = self.agent_session_ids_by_thread_view.iter().find_map(
+            |(thread_view_id, candidate_session_id)| {
+                (candidate_session_id == session_id).then_some(*thread_view_id)
+            },
+        ) {
+            return Some(thread_view_id);
         }
 
-        self.inactive_thread_tabs.iter().find_map(|tab| {
-            self.agent_thread_session_id_for_view(&tab.view, cx)
-                .as_ref()
-                .filter(|candidate_session_id| *candidate_session_id == session_id)
-                .and_then(|_| Self::agent_thread_view_id(&tab.view))
-        })
+        self.live_agent_thread_views(cx)
+            .into_iter()
+            .find_map(|(thread_view_id, thread_view)| {
+                self.thread_view_contains_session(&thread_view, session_id, cx)
+                    .then_some(thread_view_id)
+            })
     }
 
-    fn clear_pending_session_id_for_view(&mut self, view: &ActiveView) {
-        let ActiveView::AgentThread { thread_view } = view else {
+    fn thread_view_contains_session(
+        &self,
+        thread_view: &Entity<AcpServerView>,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> bool {
+        if self
+            .agent_thread_session_id(thread_view, cx)
+            .as_ref()
+            .is_some_and(|candidate_session_id| candidate_session_id == session_id)
+        {
+            return true;
+        }
+
+        thread_view.read(cx).thread_view(session_id).is_some()
+    }
+
+    fn clear_tracked_session_id_for_view(&mut self, view: &ActiveView, cx: &App) {
+        let ActiveView::AgentThread { server_view } = view else {
             return;
         };
-        self.pending_agent_session_ids_by_thread_view
-            .remove(&Entity::entity_id(thread_view));
+        let thread_view_id = Entity::entity_id(server_view);
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            let is_open_in_editor = workspace
+                .read(cx)
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+                .any(|item| item.read(cx).thread_view_id() == thread_view_id);
+            if is_open_in_editor {
+                return;
+            }
+        }
+
+        self.agent_session_ids_by_thread_view
+            .remove(&thread_view_id);
     }
 
     fn text_thread_entity_id_for_view(&self, view: &ActiveView, cx: &App) -> Option<EntityId> {
@@ -1077,15 +1183,19 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn focus_thread_view_from_notification(
+    fn focus_thread_view_by_id(
         &mut self,
         thread_view_id: EntityId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<bool> {
+        if self.focus_editor_tab_item(thread_view_id, window, cx) {
+            return Some(true);
+        }
+
         if let Some(tab_id) = self.inactive_tab_id_for_agent_thread_view(thread_view_id) {
             self.activate_thread_tab(tab_id, window, cx);
-            return;
+            return Some(false);
         }
 
         let selected_tab_matches = self
@@ -1094,7 +1204,7 @@ impl AgentPanel {
             .is_some_and(|candidate_id| candidate_id == thread_view_id);
 
         if !selected_tab_matches {
-            return;
+            return None;
         }
 
         if matches!(
@@ -1110,6 +1220,41 @@ impl AgentPanel {
                 self.previous_view = Some(previous_view);
             }
         }
+
+        Some(false)
+    }
+
+    pub(crate) fn focus_thread_view_from_notification(
+        &mut self,
+        thread_view_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.focus_thread_view_by_id(thread_view_id, window, cx);
+    }
+
+    fn focus_editor_tab_item(
+        &self,
+        thread_view_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            let editor_item = workspace
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+                .find(|item| item.read(cx).thread_view_id() == thread_view_id);
+
+            if let Some(editor_item) = editor_item {
+                workspace.activate_item(&editor_item, true, true, window, cx);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     fn is_thread_view(view: &ActiveView) -> bool {
@@ -1134,14 +1279,286 @@ impl AgentPanel {
         }
     }
 
-    fn thread_tab_is_loading(view: &ActiveView, cx: &App) -> bool {
+    fn agent_thread_title_from_view(
+        thread_view: &Entity<AcpServerView>,
+        selected_agent: &AgentType,
+        cx: &App,
+    ) -> SharedString {
+        let selected_agent_label = selected_agent.label();
+        let title = thread_view
+            .read(cx)
+            .active_thread_title(cx)
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .filter(|title| title != DEFAULT_THREAD_TITLE)
+            .filter(|title| title != selected_agent_label.as_ref())
+            .map(SharedString::from);
+
+        if let Some(title) = title {
+            return title;
+        }
+
+        if let Some(preview) = thread_view
+            .read(cx)
+            .active_thread()
+            .and_then(|active_thread| {
+                active_thread
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .find_map(|entry| {
+                        let AgentThreadEntry::UserMessage(user_message) = entry else {
+                            return None;
+                        };
+
+                        let first_line = user_message
+                            .content
+                            .to_markdown(cx)
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())?;
+
+                        let mut preview = first_line.to_string();
+                        if preview.chars().count() > 48 {
+                            preview = preview.chars().take(47).collect::<String>() + "…";
+                        }
+                        Some(SharedString::from(preview))
+                    })
+            })
+        {
+            return preview;
+        }
+
+        selected_agent_label
+    }
+
+    fn agent_thread_status_label(thread_view: &Entity<AcpServerView>, cx: &App) -> SharedString {
+        Self::thread_tab_status_label(thread_view.read(cx).status_for_collaboration(cx))
+    }
+
+    fn short_path_for_agent_location(
+        project: &Project,
+        location: &AgentLocation,
+        cx: &App,
+    ) -> Option<SharedString> {
+        let buffer = location.buffer.upgrade()?;
+        let buffer = buffer.read(cx);
+        let file = buffer.file()?;
+        let project_path = ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        };
+
+        project
+            .short_full_path_for_project_path(&project_path, cx)
+            .map(SharedString::from)
+            .or_else(|| Some(file.full_path(cx).to_string_lossy().to_string().into()))
+    }
+
+    fn short_path_for_tool_call_location(
+        project: &Project,
+        location: &acp::ToolCallLocation,
+        cx: &App,
+    ) -> Option<SharedString> {
+        project
+            .find_project_path(&location.path, cx)
+            .and_then(|project_path| project.short_full_path_for_project_path(&project_path, cx))
+            .map(SharedString::from)
+            .or_else(|| {
+                location
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string().into())
+            })
+            .or_else(|| Some(location.path.to_string_lossy().to_string().into()))
+    }
+
+    fn agent_thread_last_file_from_view(
+        thread_view: &Entity<AcpServerView>,
+        cx: &App,
+    ) -> Option<SharedString> {
+        let active_thread = thread_view.read(cx).active_thread()?.clone();
+        let project = active_thread.read(cx).project.upgrade()?;
+        let thread = active_thread.read(cx).thread.clone();
+        let thread = thread.read(cx);
+        let project = project.read(cx);
+        let session_id = thread.session_id().0.clone();
+
+        for entry in thread.entries().iter().rev() {
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+
+            for (location_index, location) in tool_call.locations.iter().enumerate().rev() {
+                if let Some(resolved_location) = tool_call
+                    .resolved_locations
+                    .get(location_index)
+                    .and_then(|location| location.as_ref())
+                    && let Some(path) =
+                        Self::short_path_for_agent_location(&project, resolved_location, cx)
+                {
+                    return Some(path);
+                }
+
+                if let Some(path) = Self::short_path_for_tool_call_location(&project, location, cx)
+                {
+                    return Some(path);
+                }
+            }
+        }
+
+        project
+            .agent_location_for_session(Some(session_id.as_ref()))
+            .and_then(|location| Self::short_path_for_agent_location(&project, &location, cx))
+    }
+
+    fn thread_tab_title(view: &ActiveView, selected_agent: &AgentType, cx: &App) -> SharedString {
         match view {
-            ActiveView::AgentThread { thread_view } => thread_view.read(cx).is_loading(),
+            ActiveView::AgentThread { server_view } => {
+                Self::agent_thread_title_from_view(server_view, selected_agent, cx)
+            }
+            ActiveView::TextThread {
+                text_thread_editor, ..
+            } => {
+                let title = text_thread_editor.read(cx).title(cx);
+                if title.as_ref().trim().is_empty() {
+                    selected_agent.label()
+                } else {
+                    title
+                }
+            }
+            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
+                selected_agent.label()
+            }
+        }
+    }
+
+    fn thread_tab_status(view: &ActiveView, cx: &App) -> ThreadViewStatus {
+        match view {
+            ActiveView::AgentThread { server_view } => {
+                server_view.read(cx).status_for_collaboration(cx)
+            }
             ActiveView::Uninitialized
             | ActiveView::TextThread { .. }
             | ActiveView::History { .. }
-            | ActiveView::Configuration => false,
+            | ActiveView::Configuration => ThreadViewStatus::Idle,
         }
+    }
+
+    fn thread_tab_status_label(status: ThreadViewStatus) -> SharedString {
+        match status {
+            ThreadViewStatus::Idle => "Idle".into(),
+            ThreadViewStatus::Loading => "Loading".into(),
+            ThreadViewStatus::Generating => "Generating".into(),
+            ThreadViewStatus::WaitingForApproval => "Waiting for approval".into(),
+            ThreadViewStatus::Error => "Error".into(),
+        }
+    }
+
+    fn agent_thread_project_id_from_view(
+        thread_view: &Entity<AcpServerView>,
+        fallback_project_id: Option<u64>,
+        cx: &App,
+    ) -> Option<u64> {
+        thread_view
+            .read(cx)
+            .active_thread()
+            .and_then(|active_thread| {
+                active_thread
+                    .read(cx)
+                    .project
+                    .upgrade()
+                    .and_then(|project| project.read(cx).remote_id())
+            })
+            .or(fallback_project_id)
+    }
+
+    fn should_show_collaboration_presence(thread_view: &Entity<AcpServerView>, cx: &App) -> bool {
+        let Some(active_thread) = thread_view.read(cx).active_thread().cloned() else {
+            return false;
+        };
+
+        let active_thread = active_thread.read(cx);
+        if active_thread.resume_thread_metadata.is_some() {
+            return true;
+        }
+
+        !active_thread.thread.read(cx).entries().is_empty()
+    }
+
+    pub fn collaboration_presences(&self, cx: &App) -> Vec<AgentCollaborationPresence> {
+        let mut presences = Vec::new();
+        let mut seen_thread_views = HashSet::default();
+        let fallback_project_id = self.project.read(cx).remote_id();
+
+        let mut add_presence = |thread_view: &Entity<AcpServerView>, selected_agent: &AgentType| {
+            let thread_view_id = Entity::entity_id(thread_view);
+            if !Self::should_show_collaboration_presence(thread_view, cx) {
+                return;
+            }
+            if !seen_thread_views.insert(thread_view_id) {
+                return;
+            }
+
+            presences.push(AgentCollaborationPresence {
+                thread_view_id,
+                session_id: self
+                    .agent_thread_session_id(thread_view, cx)
+                    .map(|session_id| session_id.0.into()),
+                icon: selected_agent.icon(),
+                title: Self::agent_thread_title_from_view(thread_view, selected_agent, cx),
+                status: Self::agent_thread_status_label(thread_view, cx),
+                file: Self::agent_thread_last_file_from_view(thread_view, cx),
+                project_id: Self::agent_thread_project_id_from_view(
+                    thread_view,
+                    fallback_project_id,
+                    cx,
+                ),
+            });
+        };
+
+        if let Some(current_view) = self.current_thread_view_for_tabs()
+            && let ActiveView::AgentThread { server_view } = current_view
+        {
+            add_presence(server_view, &self.selected_agent);
+        }
+
+        for tab in &self.inactive_thread_tabs {
+            if let ActiveView::AgentThread { server_view } = &tab.view {
+                add_presence(server_view, &tab.selected_agent);
+            }
+        }
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            for item in workspace
+                .read(cx)
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+            {
+                let item = item.read(cx);
+                add_presence(&item.thread_view, &item.selected_agent);
+            }
+        }
+
+        presences
+    }
+
+    pub fn focus_collaboration_thread(
+        &mut self,
+        thread_view_id: EntityId,
+        session_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        if let Some(outcome) = self.focus_thread_view_by_id(thread_view_id, window, cx) {
+            return Some(outcome);
+        }
+
+        let session_id = session_id.map(acp::SessionId::new)?;
+        let thread_view_id = self.thread_view_id_for_session(&session_id, cx)?;
+        self.focus_thread_view_by_id(thread_view_id, window, cx)
     }
 
     fn take_current_thread_view(&mut self) -> Option<ActiveView> {
@@ -1214,7 +1631,7 @@ impl AgentPanel {
                 .position(|tab| tab.id == tab_id)
             {
                 let closed_tab = self.inactive_thread_tabs.remove(index);
-                self.clear_pending_session_id_for_view(&closed_tab.view);
+                self.clear_tracked_session_id_for_view(&closed_tab.view, cx);
                 self.serialize(cx);
                 cx.notify();
             }
@@ -1223,7 +1640,7 @@ impl AgentPanel {
 
         let closed_tab = self.take_current_thread_view();
         if let Some(closed_tab) = closed_tab.as_ref() {
-            self.clear_pending_session_id_for_view(closed_tab);
+            self.clear_tracked_session_id_for_view(closed_tab, cx);
         }
         let next_tab_index = self
             .inactive_thread_tabs
@@ -1286,7 +1703,7 @@ impl AgentPanel {
                 window,
                 cx,
             ),
-            AgentType::ClaudeCode => self.external_thread_with_tab_mode(
+            AgentType::ClaudeAgent => self.external_thread_with_tab_mode(
                 Some(ExternalAgent::ClaudeCode),
                 None,
                 None,
@@ -1423,6 +1840,14 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(thread_view_id) = resume_thread
+            .as_ref()
+            .and_then(|thread| self.thread_view_id_for_session(&thread.session_id, cx))
+        {
+            self.focus_thread_view_from_notification(thread_view_id, window, cx);
+            return;
+        }
+
         let open_in_new_tab = open_in_new_tab_override.unwrap_or(resume_thread.is_none());
         let workspace = self.workspace.clone();
         let project = self.project.clone();
@@ -2162,6 +2587,18 @@ impl AgentPanel {
         cx.emit(AgentPanelEvent::ActiveViewChanged);
     }
 
+    fn recently_updated_agent_sessions_for_menu(&self, cx: &App) -> Vec<AgentSessionInfo> {
+        let open_session_ids = self.open_agent_session_ids(cx);
+        self.acp_history
+            .read(cx)
+            .sessions()
+            .iter()
+            .filter(|entry| !open_session_ids.contains(&entry.session_id))
+            .take(RECENTLY_UPDATED_MENU_LIMIT)
+            .cloned()
+            .collect()
+    }
+
     fn populate_recently_updated_menu_section(
         mut menu: ContextMenu,
         panel: Entity<Self>,
@@ -2170,15 +2607,7 @@ impl AgentPanel {
     ) -> ContextMenu {
         match kind {
             HistoryKind::AgentThreads => {
-                let entries = panel
-                    .read(cx)
-                    .acp_history
-                    .read(cx)
-                    .sessions()
-                    .iter()
-                    .take(RECENTLY_UPDATED_MENU_LIMIT)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let entries = panel.read(cx).recently_updated_agent_sessions_for_menu(cx);
 
                 if entries.is_empty() {
                     return menu;
@@ -2264,7 +2693,7 @@ impl AgentPanel {
         match agent_type {
             AgentType::NativeAgent | AgentType::TextThread => settings.show_zed_agent,
             AgentType::Gemini => settings.show_gemini_cli,
-            AgentType::ClaudeCode => settings.show_claude_code,
+            AgentType::ClaudeAgent => settings.show_claude_code,
             AgentType::Codex => settings.show_codex_cli,
             AgentType::Custom { .. } => false,
         }
@@ -2292,7 +2721,7 @@ impl AgentPanel {
             .external_agents()
             .filter(|agent_name| {
                 agent_name.0.as_ref() != GEMINI_NAME
-                    && agent_name.0.as_ref() != CLAUDE_CODE_NAME
+                    && agent_name.0.as_ref() != CLAUDE_AGENT_NAME
                     && agent_name.0.as_ref() != CODEX_NAME
             })
             .next()
@@ -2307,7 +2736,7 @@ impl AgentPanel {
             return Some(AgentType::NativeAgent);
         }
         if settings.show_claude_code {
-            return Some(AgentType::ClaudeCode);
+            return Some(AgentType::ClaudeAgent);
         }
         if settings.show_codex_cli {
             return Some(AgentType::Codex);
@@ -2585,11 +3014,11 @@ impl AgentPanel {
                 cx,
             )
         });
-        let thread_view_id = Entity::entity_id(&thread_view);
-        self.pending_agent_session_ids_by_thread_view
+        let thread_view_id = Entity::entity_id(&server_view);
+        self.agent_session_ids_by_thread_view
             .remove(&thread_view_id);
         if let Some(session_id) = pending_session_id {
-            self.pending_agent_session_ids_by_thread_view
+            self.agent_session_ids_by_thread_view
                 .insert(thread_view_id, session_id);
         }
 
@@ -3158,7 +3587,7 @@ impl AgentPanel {
                                 .external_agents()
                                 .filter(|name| {
                                     name.0.as_ref() != GEMINI_NAME
-                                        && name.0.as_ref() != CLAUDE_CODE_NAME
+                                        && name.0.as_ref() != CLAUDE_AGENT_NAME
                                         && name.0.as_ref() != CODEX_NAME
                                 })
                                 .map(|agent_name| {
@@ -3250,7 +3679,7 @@ impl AgentPanel {
                             if show_claude_code {
                                 menu = menu.item(
                                     ContextMenuEntry::new("Claude Code")
-                                        .when(is_agent_selected(AgentType::ClaudeCode), |this| {
+                                        .when(is_agent_selected(AgentType::ClaudeAgent), |this| {
                                             this.action(Box::new(NewExternalAgentThread {
                                                 agent: None,
                                             }))
@@ -3268,7 +3697,7 @@ impl AgentPanel {
                                                         {
                                                             panel.update(cx, |panel, cx| {
                                                                 panel.new_agent_thread(
-                                                                    AgentType::ClaudeCode,
+                                                                    AgentType::ClaudeAgent,
                                                                     window,
                                                                     cx,
                                                                 );
@@ -3508,7 +3937,8 @@ impl AgentPanel {
         struct ThreadTabEntry {
             id: usize,
             selected_agent: AgentType,
-            loading: bool,
+            title: SharedString,
+            status: ThreadViewStatus,
         }
 
         if !matches!(
@@ -3524,7 +3954,8 @@ impl AgentPanel {
             .map(|tab| ThreadTabEntry {
                 id: tab.id,
                 selected_agent: tab.selected_agent.clone(),
-                loading: Self::thread_tab_is_loading(&tab.view, cx),
+                title: Self::thread_tab_title(&tab.view, &tab.selected_agent, cx),
+                status: Self::thread_tab_status(&tab.view, cx),
             })
             .collect::<Vec<_>>();
 
@@ -3532,13 +3963,10 @@ impl AgentPanel {
         entries.push(ThreadTabEntry {
             id: self.active_thread_tab_id,
             selected_agent: self.selected_agent.clone(),
-            loading: Self::thread_tab_is_loading(active_view, cx),
+            title: Self::thread_tab_title(active_view, &self.selected_agent, cx),
+            status: Self::thread_tab_status(active_view, cx),
         });
         entries.sort_by_key(|entry| entry.id);
-
-        if entries.len() <= 1 {
-            return None;
-        }
 
         let selected_index = entries
             .iter()
@@ -3570,6 +3998,36 @@ impl AgentPanel {
                 TabPosition::Middle(index.cmp(&selected_index))
             };
 
+            let status_icon = match entry.status {
+                ThreadViewStatus::Idle => None,
+                ThreadViewStatus::Loading => Some(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted)
+                        .with_rotate_animation(4)
+                        .into_any_element(),
+                ),
+                ThreadViewStatus::Generating => Some(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Info)
+                        .with_rotate_animation(4)
+                        .into_any_element(),
+                ),
+                ThreadViewStatus::WaitingForApproval => Some(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Warning)
+                        .into_any_element(),
+                ),
+                ThreadViewStatus::Error => Some(
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error)
+                        .into_any_element(),
+                ),
+            };
+
             let tab = Tab::new(("agent-thread-tab", tab_id as u64))
                 .position(tab_position)
                 .toggle_state(index == selected_index)
@@ -3583,13 +4041,12 @@ impl AgentPanel {
                             this.child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
                         })
                         .child(
-                            Label::new(entry.selected_agent.label())
-                                .size(LabelSize::Small)
-                                .truncate(),
+                            div()
+                                .min_w_0()
+                                .max_w(px(220.))
+                                .child(Label::new(entry.title).size(LabelSize::Small).truncate()),
                         )
-                        .when(entry.loading, |this| {
-                            this.child(Icon::new(IconName::ArrowCircle).size(IconSize::XSmall))
-                        }),
+                        .when_some(status_icon, |this, status_icon| this.child(status_icon)),
                 )
                 .end_slot::<AnyElement>(Some(close_button.into_any_element()));
 
@@ -4132,16 +4589,20 @@ impl Focusable for AgentThreadEditorTabItem {
 impl Item for AgentThreadEditorTabItem {
     type Event = ();
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        self.selected_agent.label()
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        AgentPanel::agent_thread_title_from_view(&self.thread_view, &self.selected_agent, cx)
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         self.selected_agent.icon().map(Icon::new)
     }
 
-    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
-        Some(self.selected_agent.label())
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        Some(AgentPanel::agent_thread_title_from_view(
+            &self.thread_view,
+            &self.selected_agent,
+            cx,
+        ))
     }
 
     fn include_in_nav_history() -> bool {
@@ -4370,12 +4831,38 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::acp::thread_view::tests::{StubAgentServer, init_test};
+    use acp_thread::{AgentSessionList, AgentSessionListRequest, AgentSessionListResponse};
     use assistant_text_thread::TextThreadStore;
     use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
     use workspace::MultiWorkspace;
+
+    #[derive(Clone)]
+    struct StaticSessionList {
+        sessions: Vec<AgentSessionInfo>,
+    }
+
+    impl StaticSessionList {
+        fn new(sessions: Vec<AgentSessionInfo>) -> Self {
+            Self { sessions }
+        }
+    }
+
+    impl AgentSessionList for StaticSessionList {
+        fn list_sessions(
+            &self,
+            _request: AgentSessionListRequest,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<AgentSessionListResponse>> {
+            Task::ready(Ok(AgentSessionListResponse::new(self.sessions.clone())))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
+    }
 
     #[gpui::test]
     async fn test_active_thread_serialize_and_load_round_trip(cx: &mut TestAppContext) {
@@ -4557,6 +5044,318 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_single_open_thread_renders_as_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let has_thread_tabs = panel.update(cx, |panel, cx| panel.render_thread_tabs(cx).is_some());
+        assert!(
+            has_thread_tabs,
+            "single open thread should render with tab UI",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_collaboration_presences_hide_empty_fresh_thread_until_message_sent(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.collaboration_presences(cx).is_empty(),
+                "freshly opened empty threads should not be exposed in collaboration presence surfaces",
+            );
+        });
+
+        let thread_view = panel.read_with(cx, |panel, _cx| {
+            panel
+                .active_thread_view_for_tests()
+                .expect("expected an active thread view")
+                .clone()
+        });
+
+        thread_view.update_in(cx, |thread_view, window, cx| {
+            let active_thread = thread_view
+                .active_thread()
+                .cloned()
+                .expect("expected active thread");
+
+            active_thread.update(cx, |active_thread, cx| {
+                active_thread.message_editor.update(cx, |editor, cx| {
+                    editor.set_text("Hello from the test", window, cx);
+                });
+                active_thread.send(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.collaboration_presences(cx).len(),
+                1,
+                "thread should appear in collaboration presence surfaces after a message is sent",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collaboration_presences_include_resumed_thread_without_messages(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel.read_with(cx, |panel, _cx| {
+            panel
+                .active_thread_view_for_tests()
+                .expect("expected an active thread view")
+                .clone()
+        });
+
+        thread_view.update(cx, |thread_view, cx| {
+            let active_thread = thread_view
+                .active_thread()
+                .cloned()
+                .expect("expected active thread");
+            active_thread.update(cx, |active_thread, _cx| {
+                active_thread.resume_thread_metadata = Some(AgentSessionInfo::new(
+                    acp::SessionId::new("resumed-session"),
+                ));
+            });
+        });
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.collaboration_presences(cx).len(),
+                1,
+                "resumed threads should be exposed even before new messages are sent",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_recent_menu_excludes_open_agent_sessions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let open_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+        let closed_session_id = acp::SessionId::new("closed-session");
+        let sessions = vec![
+            AgentSessionInfo {
+                session_id: open_session_id.clone(),
+                cwd: None,
+                title: Some("Open Session".into()),
+                updated_at: None,
+                meta: None,
+            },
+            AgentSessionInfo {
+                session_id: closed_session_id.clone(),
+                cwd: None,
+                title: Some("Closed Session".into()),
+                updated_at: None,
+                meta: None,
+            },
+        ];
+
+        panel.update(cx, |panel, cx| {
+            panel.acp_history.update(cx, |history, cx| {
+                history.set_session_list(Some(Rc::new(StaticSessionList::new(sessions))), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let recent_sessions = panel.recently_updated_agent_sessions_for_menu(cx);
+            assert_eq!(
+                recent_sessions.len(),
+                1,
+                "recent sessions should exclude sessions that already have an open tab",
+            );
+            assert_eq!(
+                recent_sessions[0].session_id, closed_session_id,
+                "the remaining recent entry should be the first not-open session",
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_reopening_same_agent_session_does_not_create_duplicate_tab(
         cx: &mut TestAppContext,
     ) {
@@ -4646,6 +5445,483 @@ mod tests {
                 "active session should remain unchanged when reopening the same session",
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_reopening_same_agent_session_in_editor_tab_does_not_open_panel_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (session_id, thread_view_id) = panel.read_with(cx, |panel, cx| {
+            let thread_view = panel
+                .active_thread_view_for_tests()
+                .expect("expected an active thread view")
+                .clone();
+            let session_id = panel
+                .active_agent_thread(cx)
+                .expect("expected an active agent thread")
+                .read(cx)
+                .session_id()
+                .clone();
+            (session_id, Entity::entity_id(&thread_view))
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_active_thread_in_editor_tab(&OpenActiveThreadInEditorTab, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            let items = workspace
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items.len(),
+                1,
+                "moving a thread to editor tabs should create a single editor tab item",
+            );
+            assert_eq!(
+                items[0].read(cx).thread_view_id(),
+                thread_view_id,
+                "editor tab item should correspond to the original thread view",
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread_in_new_tab(
+                AgentSessionInfo {
+                    session_id: session_id.clone(),
+                    cwd: None,
+                    title: None,
+                    updated_at: None,
+                    meta: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(
+                panel.inactive_thread_tabs.len(),
+                0,
+                "reopening a session already open in editor tabs should not create a new panel tab",
+            );
+            assert!(
+                panel.active_thread_view().is_none(),
+                "reopening should focus the editor tab instead of creating a panel thread view",
+            );
+        });
+
+        workspace.read_with(cx, |workspace, cx| {
+            let items = workspace
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items.len(),
+                1,
+                "reopening should focus the existing editor tab item instead of duplicating it",
+            );
+            assert_eq!(
+                items[0].read(cx).thread_view_id(),
+                thread_view_id,
+                "the existing editor tab item should remain the same thread view",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reopening_inactive_agent_session_focuses_existing_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let server = Rc::new(StubAgentServer::default_response());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active first agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let second_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active second agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+        assert_ne!(
+            first_session_id, second_session_id,
+            "test setup should create two distinct sessions",
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread_in_new_tab(
+                AgentSessionInfo {
+                    session_id: first_session_id.clone(),
+                    cwd: None,
+                    title: None,
+                    updated_at: None,
+                    meta: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let active_session_id = panel
+                .active_agent_thread(cx)
+                .expect("expected an active agent thread after reopening")
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                active_session_id, first_session_id,
+                "reopening should focus the existing inactive tab for that session",
+            );
+
+            assert_eq!(
+                panel.inactive_thread_tabs.len(),
+                1,
+                "reopening an inactive session should not create a duplicate tab",
+            );
+            let ActiveView::AgentThread { server_view } = &panel.inactive_thread_tabs[0].view
+            else {
+                panic!("expected the remaining inactive tab to be an agent thread");
+            };
+            let inactive_session_id = server_view
+                .read(cx)
+                .active_thread()
+                .expect("expected the remaining inactive tab thread view to be connected")
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                inactive_session_id, second_session_id,
+                "the other session should remain as the single inactive tab",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reopening_editor_agent_session_with_other_open_tab_does_not_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let server = Rc::new(StubAgentServer::default_response());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active first agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_active_thread_in_editor_tab(&OpenActiveThreadInEditorTab, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let second_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active second agent thread")
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+        assert_ne!(
+            first_session_id, second_session_id,
+            "test setup should create two distinct sessions",
+        );
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread_in_new_tab(
+                AgentSessionInfo {
+                    session_id: first_session_id.clone(),
+                    cwd: None,
+                    title: None,
+                    updated_at: None,
+                    meta: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let active_session_id = panel
+                .active_agent_thread(cx)
+                .expect("expected the panel session to stay active")
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                active_session_id, second_session_id,
+                "reopening an editor session should not create or activate a duplicate panel tab",
+            );
+            assert_eq!(
+                panel.inactive_thread_tabs.len(),
+                0,
+                "reopening an editor session should not add inactive panel tabs",
+            );
+        });
+
+        workspace.read_with(cx, |workspace, cx| {
+            let items = workspace
+                .items_of_type::<AgentThreadEditorTabItem>(cx)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items.len(),
+                1,
+                "reopening should keep exactly one editor tab for that session",
+            );
+
+            let editor_session_id = items[0]
+                .read(cx)
+                .thread_view
+                .read(cx)
+                .active_thread()
+                .expect("expected editor tab thread view to be connected")
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                editor_session_id, first_session_id,
+                "the existing editor tab should remain bound to the original reopened session",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_focus_collaboration_thread_prefers_editor_session_when_thread_view_id_is_stale(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let slash_command_registry =
+                assistant_slash_command::SlashCommandRegistry::default_global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
+            let panel =
+                cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let server = Rc::new(StubAgentServer::default_response());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let first_session_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_agent_thread(cx)
+                .expect("expected an active first agent thread")
+                .read(cx)
+                .session_id()
+                .0
+                .clone()
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_active_thread_in_editor_tab(&OpenActiveThreadInEditorTab, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let unrelated_thread_view_id =
+            panel.update(cx, |_panel, cx| Entity::entity_id(&cx.new(|_| ())));
+
+        let focus_result = panel.update_in(cx, |panel, window, cx| {
+            panel.focus_collaboration_thread(
+                unrelated_thread_view_id,
+                Some(&first_session_id),
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            focus_result,
+            Some(true),
+            "stale thread view ids should fall back to session lookup and focus the editor tab",
+        );
     }
 
     #[gpui::test]

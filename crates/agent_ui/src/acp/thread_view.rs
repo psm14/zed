@@ -319,6 +319,15 @@ struct LoadingView {
     _update_title_task: Task<anyhow::Result<()>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThreadViewStatus {
+    Idle,
+    Loading,
+    Generating,
+    WaitingForApproval,
+    Error,
+}
+
 impl ConnectedServerState {
     pub fn active_view(&self) -> Option<&Entity<AcpThreadView>> {
         self.active_id.as_ref().and_then(|id| self.threads.get(id))
@@ -1001,6 +1010,37 @@ impl AcpServerView {
                 LoadError::Exited { .. } => format!("{} Exited", self.agent.name()).into(),
                 LoadError::Other(_) => format!("Error Loading {}", self.agent.name()).into(),
             },
+        }
+    }
+
+    pub(crate) fn active_thread_title(&self, cx: &App) -> Option<SharedString> {
+        let connected = self.as_connected()?;
+        let active_view = connected.active_view()?;
+        Some(active_view.read(cx).thread.read(cx).title())
+    }
+
+    pub(crate) fn status_for_collaboration(&self, cx: &App) -> ThreadViewStatus {
+        match &self.server_state {
+            ServerState::Loading(_) => ThreadViewStatus::Loading,
+            ServerState::LoadError(_) => ThreadViewStatus::Error,
+            ServerState::Connected(connected) => {
+                if connected.auth_state.is_ok() && connected.has_thread_error(cx) {
+                    return ThreadViewStatus::Error;
+                }
+
+                let Some(active_view) = connected.active_view() else {
+                    return ThreadViewStatus::Idle;
+                };
+                let thread = active_view.read(cx).thread.read(cx);
+
+                if thread.first_tool_awaiting_confirmation().is_some() {
+                    ThreadViewStatus::WaitingForApproval
+                } else if thread.status() == ThreadStatus::Generating {
+                    ThreadViewStatus::Generating
+                } else {
+                    ThreadViewStatus::Idle
+                }
+            }
         }
     }
 
@@ -2377,20 +2417,21 @@ impl AcpServerView {
                                                 });
 
                                             if !focused_editor_item {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    workspace.focus_panel::<AgentPanel>(window, cx);
-                                                    if let Some(panel) =
+                                                let panel =
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        workspace
+                                                            .focus_panel::<AgentPanel>(window, cx);
                                                         workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.focus_thread_view_from_notification(
-                                                                thread_view_id,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                });
+                                                    });
+                                                if let Some(panel) = panel {
+                                                    panel.update(cx, |panel, cx| {
+                                                        panel.focus_thread_view_from_notification(
+                                                            thread_view_id,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
                                             }
                                         }
                                     })

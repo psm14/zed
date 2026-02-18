@@ -12,3 +12,4 @@ pub use model_selector::AcpModelSelector;
 pub use model_selector_popover::AcpModelSelectorPopover;
 pub use thread_history::*;
 pub use thread_view::AcpServerView;
+pub(crate) use thread_view::ThreadViewStatus;
