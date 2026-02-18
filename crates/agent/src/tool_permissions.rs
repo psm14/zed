@@ -535,6 +535,10 @@ mod tests {
         AgentSettings {
             enabled: true,
             button: true,
+            show_zed_agent: true,
+            show_claude_code: true,
+            show_codex_cli: true,
+            show_gemini_cli: true,
             dock: DockPosition::Right,
             default_width: px(300.),
             default_height: px(600.),
@@ -554,6 +558,7 @@ mod tests {
             model_parameters: vec![],
             enable_feedback: false,
             expand_edit_card: true,
+            auto_keep_edits: false,
             expand_terminal_card: true,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,

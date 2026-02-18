@@ -934,6 +934,14 @@
     "enabled": true,
     // Whether to show the agent panel button in the status bar.
     "button": true,
+    // Whether to show Zed's first-party agent options in the new thread menu.
+    "show_zed_agent": true,
+    // Whether to show Claude Code in the new thread menu.
+    "show_claude_code": true,
+    // Whether to show Codex CLI in the new thread menu.
+    "show_codex_cli": true,
+    // Whether to show Gemini CLI in the new thread menu.
+    "show_gemini_cli": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
     "dock": "right",
     // Default width when the agent panel is docked to the left or right.
@@ -1087,6 +1095,10 @@
     //
     // Default: true
     "expand_edit_card": true,
+    // Whether to hide keep/reject controls in the agent panel and automatically keep edits when a turn completes.
+    //
+    // Default: false
+    "auto_keep_edits": false,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
     // Default: true

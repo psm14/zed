@@ -20,6 +20,22 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
+    /// Whether to show Zed's first-party agent options in the new thread menu.
+    ///
+    /// Default: true
+    pub show_zed_agent: Option<bool>,
+    /// Whether to show Claude Code in the new thread menu.
+    ///
+    /// Default: true
+    pub show_claude_code: Option<bool>,
+    /// Whether to show Codex CLI in the new thread menu.
+    ///
+    /// Default: true
+    pub show_codex_cli: Option<bool>,
+    /// Whether to show Gemini CLI in the new thread menu.
+    ///
+    /// Default: true
+    pub show_gemini_cli: Option<bool>,
     /// Where to dock the agent panel.
     ///
     /// Default: right
@@ -90,6 +106,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_edit_card: Option<bool>,
+    /// Whether to hide keep/reject controls in the agent panel and automatically keep edits when a turn finishes.
+    ///
+    /// Default: false
+    pub auto_keep_edits: Option<bool>,
     /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     ///
     /// Default: true

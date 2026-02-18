@@ -1061,6 +1061,16 @@ impl AcpServerView {
                         active.thread_retry_status.take();
                     });
                 }
+
+                if AgentSettings::get_global(cx).auto_keep_edits {
+                    thread.update(cx, |thread, cx| {
+                        let telemetry = ActionLogTelemetry::from(&*thread);
+                        thread.action_log().update(cx, |action_log, cx| {
+                            action_log.keep_all_edits(Some(telemetry), cx);
+                        });
+                    });
+                }
+
                 if is_subagent {
                     return;
                 }
@@ -2623,6 +2633,90 @@ pub(crate) mod tests {
             cx.windows()
                 .iter()
                 .any(|window| window.downcast::<AgentNotification>().is_some())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_auto_keep_edits_when_turn_stops(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    auto_keep_edits: true,
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) =
+            setup_thread_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(thread_view.clone(), cx);
+
+        let message_editor = message_editor(&thread_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&thread_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+
+        let (thread, session_id) = thread_view.read_with(cx, |view, cx| {
+            let thread = view
+                .active_thread()
+                .expect("Thread should exist")
+                .read(cx)
+                .thread
+                .clone();
+            (thread.clone(), thread.read(cx).session_id().clone())
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "Response chunk".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (project, action_log) = thread.read_with(cx, |thread, _cx| {
+            (thread.project().clone(), thread.action_log().clone())
+        });
+
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("let a = 1;", None, false, cx)
+        });
+
+        action_log.update(cx, |action_log, cx| {
+            action_log.buffer_created(buffer.clone(), cx);
+        });
+        buffer.update(cx, |buffer, cx| buffer.set_text("let a = 2;", cx));
+        action_log.update(cx, |action_log, cx| {
+            action_log.buffer_edited(buffer.clone(), cx);
+        });
+
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.changed_buffers(cx).len()),
+            1
+        );
+
+        cx.update(|_, _cx| {
+            connection.end_turn(session_id, acp::StopReason::EndTurn);
+        });
+
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.changed_buffers(cx).len()),
+            0
         );
     }
 
