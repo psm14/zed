@@ -914,6 +914,7 @@ impl Server {
             connection_id,
             proto::Hello {
                 peer_id: Some(connection_id.into()),
+                user_id: session.user_id().to_proto(),
             },
         )?;
         tracing::info!("sent hello message");
@@ -1275,9 +1276,16 @@ async fn create_room(
         let user_id = session.user_id().to_string();
 
         let token = live_kit.room_token(&livekit_room, &user_id).trace_err()?;
+        let server_url = session
+            .app_state
+            .config
+            .livekit_public_server
+            .as_deref()
+            .unwrap_or(live_kit.url())
+            .to_owned();
 
         Some(proto::LiveKitConnectionInfo {
-            server_url: live_kit.url().into(),
+            server_url,
             token,
             can_publish: true,
         })
@@ -1341,6 +1349,13 @@ async fn join_room(
 
     let live_kit_connection_info = if let Some(live_kit) = session.app_state.livekit_client.as_ref()
     {
+        let server_url = session
+            .app_state
+            .config
+            .livekit_public_server
+            .as_deref()
+            .unwrap_or(live_kit.url())
+            .to_owned();
         live_kit
             .room_token(
                 &joined_room.room.livekit_room,
@@ -1348,7 +1363,7 @@ async fn join_room(
             )
             .trace_err()
             .map(|token| proto::LiveKitConnectionInfo {
-                server_url: live_kit.url().into(),
+                server_url,
                 token,
                 can_publish: true,
             })
@@ -3260,6 +3275,13 @@ async fn join_channel_internal(
                 .livekit_client
                 .as_ref()
                 .and_then(|live_kit| {
+                    let server_url = session
+                        .app_state
+                        .config
+                        .livekit_public_server
+                        .as_deref()
+                        .unwrap_or(live_kit.url())
+                        .to_owned();
                     let (can_publish, token) = if role == ChannelRole::Guest {
                         (
                             false,
@@ -3283,7 +3305,7 @@ async fn join_channel_internal(
                     };
 
                     Some(LiveKitConnectionInfo {
-                        server_url: live_kit.url().into(),
+                        server_url,
                         token,
                         can_publish,
                     })

@@ -13,8 +13,11 @@ use async_tungstenite::tungstenite::{
     http::{HeaderValue, Request, StatusCode},
 };
 use clock::SystemClock;
-use cloud_api_client::CloudApiClient;
 use cloud_api_client::websocket_protocol::MessageToClient;
+use cloud_api_client::{
+    AuthenticatedUser, CloudApiClient, GetAuthenticatedUserResponse, KnownOrUnknown, Plan, PlanInfo,
+};
+use cloud_llm_client::{CurrentUsage, UsageData, UsageLimit};
 use credentials_provider::CredentialsProvider;
 use feature_flags::FeatureFlagAppExt as _;
 use futures::{
@@ -98,6 +101,45 @@ actions!(
 #[derive(Deserialize, RegisterSetting)]
 pub struct ClientSettings {
     pub server_url: String,
+    pub collaboration_server_url: Option<String>,
+    #[serde(default)]
+    pub trusted_collaboration: TrustedCollaborationSettings,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub struct TrustedCollaborationSettings {
+    pub github_login: Option<String>,
+    pub admin_api_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct TrustedCollaborationConfig {
+    github_login: String,
+    admin_api_token: String,
+}
+
+impl ClientSettings {
+    fn trusted_collaboration_config(&self) -> Option<TrustedCollaborationConfig> {
+        let github_login = self
+            .trusted_collaboration
+            .github_login
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_ascii_lowercase();
+        let admin_api_token = self
+            .trusted_collaboration
+            .admin_api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+
+        Some(TrustedCollaborationConfig {
+            github_login,
+            admin_api_token,
+        })
+    }
 }
 
 impl Settings for ClientSettings {
@@ -105,10 +147,28 @@ impl Settings for ClientSettings {
         if let Some(server_url) = &*ZED_SERVER_URL {
             return Self {
                 server_url: server_url.clone(),
+                collaboration_server_url: content.collaboration_server_url.clone(),
+                trusted_collaboration: content
+                    .trusted_collaboration
+                    .clone()
+                    .map(|settings| TrustedCollaborationSettings {
+                        github_login: settings.github_login.clone(),
+                        admin_api_token: settings.admin_api_token.clone(),
+                    })
+                    .unwrap_or_default(),
             };
         }
         Self {
             server_url: content.server_url.clone().unwrap(),
+            collaboration_server_url: content.collaboration_server_url.clone(),
+            trusted_collaboration: content
+                .trusted_collaboration
+                .clone()
+                .map(|settings| TrustedCollaborationSettings {
+                    github_login: settings.github_login.clone(),
+                    admin_api_token: settings.admin_api_token.clone(),
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -328,8 +388,23 @@ pub struct Credentials {
 
 impl Credentials {
     pub fn authorization_header(&self) -> String {
+        if let Some((github_login, access_token)) =
+            parse_trusted_collaboration_access_token(&self.access_token)
+        {
+            return format!("{github_login} {access_token}");
+        }
         format!("{} {}", self.user_id, self.access_token)
     }
+}
+
+fn make_trusted_collaboration_access_token(github_login: &str, admin_api_token: &str) -> String {
+    format!("TRUSTED_LOGIN:{github_login}|ADMIN_TOKEN:{admin_api_token}")
+}
+
+fn parse_trusted_collaboration_access_token(access_token: &str) -> Option<(&str, &str)> {
+    let payload = access_token.strip_prefix("TRUSTED_LOGIN:")?;
+    let (github_login, delegated_token) = payload.split_once('|')?;
+    Some((github_login, delegated_token))
 }
 
 pub struct ClientCredentialsProvider {
@@ -572,6 +647,73 @@ impl Client {
         self.cloud_client.clone()
     }
 
+    fn trusted_collaboration_config(&self, cx: &AsyncApp) -> Option<TrustedCollaborationConfig> {
+        cx.update(|cx| ClientSettings::get_global(cx).trusted_collaboration_config())
+    }
+
+    pub fn trusted_collaboration_enabled(&self, cx: &AsyncApp) -> bool {
+        self.trusted_collaboration_config(cx).is_some()
+    }
+
+    fn credentials_match_trusted_collaboration_config(
+        credentials: &Credentials,
+        config: &TrustedCollaborationConfig,
+    ) -> bool {
+        let Some((github_login, delegated_token)) =
+            parse_trusted_collaboration_access_token(&credentials.access_token)
+        else {
+            return false;
+        };
+
+        github_login == config.github_login
+            && delegated_token == format!("ADMIN_TOKEN:{}", config.admin_api_token)
+    }
+
+    fn trusted_authenticated_user_response(
+        &self,
+        github_login: String,
+        user_id: u64,
+    ) -> GetAuthenticatedUserResponse {
+        let user_id = i32::try_from(user_id).unwrap_or(i32::MAX);
+        GetAuthenticatedUserResponse {
+            user: AuthenticatedUser {
+                id: user_id,
+                metrics_id: format!("trusted-{github_login}-{user_id}"),
+                avatar_url: format!("https://github.com/{github_login}.png?size=128"),
+                github_login,
+                name: None,
+                is_staff: false,
+                accepted_tos_at: None,
+            },
+            feature_flags: Vec::new(),
+            organizations: Vec::new(),
+            plan: PlanInfo {
+                plan: KnownOrUnknown::Known(Plan::ZedFree),
+                subscription_period: None,
+                usage: CurrentUsage {
+                    edit_predictions: UsageData {
+                        used: 0,
+                        limit: UsageLimit::Unlimited,
+                    },
+                },
+                trial_started_at: None,
+                is_account_too_young: false,
+                has_overdue_invoices: false,
+            },
+        }
+    }
+
+    pub async fn get_authenticated_user(
+        self: &Arc<Self>,
+        cx: &AsyncApp,
+    ) -> Result<GetAuthenticatedUserResponse> {
+        if let Some(config) = self.trusted_collaboration_config(cx) {
+            return Ok(self.trusted_authenticated_user_response(config.github_login, self.id()));
+        }
+
+        self.cloud_client.get_authenticated_user().await
+    }
+
     pub fn set_id(&self, id: u64) -> &Self {
         self.id.store(id, Ordering::SeqCst);
         self
@@ -620,11 +762,18 @@ impl Client {
     }
 
     pub fn user_id(&self) -> Option<u64> {
-        self.state
-            .read()
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.user_id)
+        let state = self.state.read();
+        let credentials = state.credentials.as_ref()?;
+        let id = self.id();
+        if id > 0 {
+            return Some(id);
+        }
+
+        if credentials.user_id > 0 {
+            Some(credentials.user_id)
+        } else {
+            None
+        }
     }
 
     pub fn peer_id(&self) -> Option<PeerId> {
@@ -846,19 +995,30 @@ impl Client {
         };
 
         let mut credentials = None;
+        let trusted_collaboration_config = self.trusted_collaboration_config(cx);
 
         let old_credentials = self.state.read().credentials.clone();
-        if let Some(old_credentials) = old_credentials
-            && self.validate_credentials(&old_credentials, cx).await?
-        {
-            credentials = Some(old_credentials);
+        if let Some(old_credentials) = old_credentials {
+            let is_valid = if let Some(config) = trusted_collaboration_config.as_ref() {
+                Self::credentials_match_trusted_collaboration_config(&old_credentials, config)
+            } else {
+                self.validate_credentials(&old_credentials, cx).await?
+            };
+            if is_valid {
+                credentials = Some(old_credentials);
+            }
         }
 
         if credentials.is_none()
             && try_provider
             && let Some(stored_credentials) = self.credentials_provider.read_credentials(cx).await
         {
-            if self.validate_credentials(&stored_credentials, cx).await? {
+            let is_valid = if let Some(config) = trusted_collaboration_config.as_ref() {
+                Self::credentials_match_trusted_collaboration_config(&stored_credentials, config)
+            } else {
+                self.validate_credentials(&stored_credentials, cx).await?
+            };
+            if is_valid {
                 credentials = Some(stored_credentials);
             } else {
                 self.credentials_provider
@@ -918,6 +1078,13 @@ impl Client {
         credentials: &Credentials,
         cx: &AsyncApp,
     ) -> Result<bool> {
+        if let Some(config) = self.trusted_collaboration_config(cx) {
+            return Ok(Self::credentials_match_trusted_collaboration_config(
+                credentials,
+                &config,
+            ));
+        }
+
         match self
             .cloud_client
             .validate_credentials(credentials.user_id as u32, &credentials.access_token)
@@ -982,15 +1149,17 @@ impl Client {
         });
 
         let credentials = self.sign_in(try_provider, cx).await?;
+        let trusted_collaboration = self.trusted_collaboration_config(cx).is_some();
 
-        self.connect_to_cloud(cx).await.log_err();
+        if !trusted_collaboration {
+            self.connect_to_cloud(cx).await.log_err();
+        }
 
         cx.update(move |cx| {
             cx.spawn({
                 let client = self.clone();
                 async move |cx| {
-                    let is_staff = is_staff_rx.await?;
-                    if is_staff {
+                    if trusted_collaboration {
                         match client.connect_with_credentials(credentials, cx).await {
                             ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
                             ConnectionResult::ConnectionReset => Err(anyhow!("connection reset")),
@@ -999,7 +1168,20 @@ impl Client {
                             }
                         }
                     } else {
-                        Ok(())
+                        let is_staff = is_staff_rx.await?;
+                        if is_staff {
+                            match client.connect_with_credentials(credentials, cx).await {
+                                ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
+                                ConnectionResult::ConnectionReset => {
+                                    Err(anyhow!("connection reset"))
+                                }
+                                ConnectionResult::Result(result) => {
+                                    result.context("client auth and connect")
+                                }
+                            }
+                        } else {
+                            Ok(())
+                        }
                     }
                 }
             })
@@ -1119,16 +1301,19 @@ impl Client {
                     )
                 })?;
             let peer_id = hello.payload.peer_id.context("invalid peer id")?;
-            Ok(peer_id)
+            Ok((peer_id, hello.payload.user_id))
         };
 
-        let peer_id = match peer_id.await {
+        let (peer_id, server_user_id) = match peer_id.await {
             Ok(peer_id) => peer_id,
             Err(error) => {
                 self.peer.disconnect(connection_id);
                 return Err(error);
             }
         };
+        if server_user_id > 0 {
+            self.set_id(server_user_id);
+        }
 
         log::debug!(
             "set status to connected (connection id: {:?}, peer id: {:?})",
@@ -1185,6 +1370,17 @@ impl Client {
             return callback(cx);
         }
 
+        if let Some(config) = self.trusted_collaboration_config(cx) {
+            let credentials = Credentials {
+                user_id: 0,
+                access_token: make_trusted_collaboration_access_token(
+                    &config.github_login,
+                    &config.admin_api_token,
+                ),
+            };
+            return Task::ready(Ok(credentials));
+        }
+
         self.authenticate_with_browser(cx)
     }
 
@@ -1205,6 +1401,7 @@ impl Client {
         &self,
         http: Arc<HttpClientWithUrl>,
         release_channel: Option<ReleaseChannel>,
+        configured_collaboration_server_url: Option<String>,
     ) -> impl Future<Output = Result<url::Url>> + use<> {
         #[cfg(any(test, feature = "test-support"))]
         let url_override = self.rpc_url.read().clone();
@@ -1217,6 +1414,10 @@ impl Client {
 
             if let Some(url) = &*ZED_RPC_URL {
                 return Url::parse(url).context("invalid rpc url");
+            }
+
+            if let Some(url) = configured_collaboration_server_url {
+                return Url::parse(&url).context("invalid collaboration server url");
             }
 
             let mut url = http.build_url("/rpc");
@@ -1251,12 +1452,17 @@ impl Client {
     ) -> Task<Result<Connection, EstablishConnectionError>> {
         let release_channel = cx.update(|cx| ReleaseChannel::try_global(cx));
         let app_version = cx.update(|cx| AppVersion::global(cx).to_string());
+        let configured_collaboration_server_url = cx.update(|cx| {
+            ClientSettings::get_global(cx)
+                .collaboration_server_url
+                .clone()
+        });
 
         let http = self.http.clone();
         let proxy = http.proxy().cloned();
         let user_agent = http.user_agent().cloned();
         let credentials = credentials.clone();
-        let rpc_url = self.rpc_url(http, release_channel);
+        let rpc_url = self.rpc_url(http, release_channel, configured_collaboration_server_url);
         let system_id = self.telemetry.system_id();
         let metrics_id = self.telemetry.metrics_id();
         cx.spawn(async move |cx| {
@@ -1270,8 +1476,8 @@ impl Client {
 
             let mut rpc_url = rpc_url.await?;
             let url_scheme = match rpc_url.scheme() {
-                "https" => Https,
-                "http" => Http,
+                "https" | "wss" => Https,
+                "http" | "ws" => Http,
                 _ => Err(anyhow!("invalid rpc url: {}", rpc_url))?,
             };
 
@@ -1813,6 +2019,29 @@ mod tests {
         assert_eq!(
             ProxySettings::from_settings(&content).proxy.as_deref(),
             Some("http://127.0.0.1:10809")
+        );
+    }
+
+    #[test]
+    fn test_credentials_authorization_header_for_standard_credentials() {
+        let credentials = Credentials {
+            user_id: 7,
+            access_token: "token".to_string(),
+        };
+
+        assert_eq!(credentials.authorization_header(), "7 token");
+    }
+
+    #[test]
+    fn test_credentials_authorization_header_for_trusted_collaboration() {
+        let credentials = Credentials {
+            user_id: 7,
+            access_token: make_trusted_collaboration_access_token("octocat", "secret"),
+        };
+
+        assert_eq!(
+            credentials.authorization_header(),
+            "octocat ADMIN_TOKEN:secret"
         );
     }
 

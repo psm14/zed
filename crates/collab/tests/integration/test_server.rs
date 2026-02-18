@@ -574,6 +574,7 @@ impl TestServer {
                 database_max_connections: 0,
                 api_token: "".into(),
                 livekit_server: None,
+                livekit_public_server: None,
                 livekit_key: None,
                 livekit_secret: None,
                 rust_log: None,

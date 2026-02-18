@@ -207,6 +207,8 @@ impl VsCodeSettings {
             remote: RemoteSettingsContent::default(),
             repl: None,
             server_url: None,
+            collaboration_server_url: None,
+            trusted_collaboration: None,
             session: None,
             status_bar: self.status_bar_settings_content(),
             tab_bar: self.tab_bar_settings_content(),

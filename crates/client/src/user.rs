@@ -222,11 +222,7 @@ impl UserStore {
                         | Status::Reauthenticated
                         | Status::Connected { .. } => {
                             if let Some(user_id) = client.user_id() {
-                                let response = client
-                                    .cloud_client()
-                                    .get_authenticated_user()
-                                    .await
-                                    .log_err();
+                                let response = client.get_authenticated_user(cx).await.log_err();
 
                                 let current_user_and_response = if let Some(response) = response {
                                     let user = Arc::new(User {
@@ -816,15 +812,11 @@ impl UserStore {
         cx.spawn(async move |cx| {
             match message {
                 MessageToClient::UserUpdated => {
-                    let cloud_client = cx
-                        .update(|cx| {
-                            this.read_with(cx, |this, _cx| {
-                                this.client.upgrade().map(|client| client.cloud_client())
-                            })
-                        })?
-                        .ok_or(anyhow::anyhow!("Failed to get Cloud client"))?;
+                    let client = cx
+                        .update(|cx| this.read_with(cx, |this, _cx| this.client.upgrade()))?
+                        .ok_or(anyhow::anyhow!("Failed to get client"))?;
 
-                    let response = cloud_client.get_authenticated_user().await?;
+                    let response = client.get_authenticated_user(&cx).await?;
                     cx.update(|cx| {
                         this.update(cx, |this, cx| {
                             this.update_authenticated_user(response, cx);

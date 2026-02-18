@@ -1,0 +1,56 @@
+services:
+  collab_db:
+    image: postgres:15
+    container_name: zed_collab_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zed
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zed"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - zed_collab_db_data:/var/lib/postgresql/data
+      - ./crates/collab/migrations/20251208000000_test_schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+
+  livekit_server:
+    image: docker.io/livekit/livekit-server
+    container_name: zed_livekit_server
+    entrypoint: /livekit-server --config /livekit.yaml
+    volumes:
+      - ./livekit.yaml:/livekit.yaml:ro
+    ports:
+      - 7880:7880
+      - 7881:7881
+      - 7882:7882/udp
+
+  collab:
+    build:
+      context: .
+      dockerfile: Dockerfile-collab
+    image: zed-collab:local
+    container_name: zed_collab
+    command: ["serve", "collab"]
+    depends_on:
+      collab_db:
+        condition: service_healthy
+      livekit_server:
+        condition: service_started
+    environment:
+      HTTP_PORT: 8080
+      DATABASE_URL: postgres://postgres:postgres@collab_db/zed
+      DATABASE_MAX_CONNECTIONS: 5
+      API_TOKEN: secret
+      LIVEKIT_SERVER: http://livekit_server:7880
+      LIVEKIT_PUBLIC_SERVER: http://localhost:7880
+      LIVEKIT_KEY: devkey
+      LIVEKIT_SECRET: secret
+      ZED_ENVIRONMENT: development
+      RUST_LOG: info
+    ports:
+      - 8080:8080
+
+volumes:
+  zed_collab_db_data:

@@ -132,6 +132,7 @@ impl FakeServer {
                             connection_id,
                             proto::Hello {
                                 peer_id: Some(connection_id.into()),
+                                user_id: client_user_id,
                             },
                         )
                         .unwrap();

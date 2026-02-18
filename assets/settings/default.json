@@ -2403,6 +2403,18 @@
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
   "server_url": "https://zed.dev",
+  // Optional direct collaboration websocket endpoint.
+  // If unset, Zed discovers the endpoint from `server_url` (or ZED_RPC_URL).
+  // Example: "https://collab.internal.example.com/rpc"
+  "collaboration_server_url": null,
+  // Trusted collaboration mode for private/internal deployments.
+  // If both values are set, Zed skips cloud auth and connects directly.
+  "trusted_collaboration": {
+    // GitHub login to present to the collaboration server.
+    "github_login": null,
+    // Shared API token used for trusted private deployments.
+    "admin_api_token": null,
+  },
   // Settings overrides to use when using Zed Preview.
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {

@@ -505,6 +505,7 @@ message Envelope {
 
 message Hello {
     PeerId peer_id = 1;
+    uint64 user_id = 2;
 }
 
 message Ping {}
