@@ -26,10 +26,10 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, AnyView, App, ClickEvent, ClipboardItem, CursorStyle,
-    ElementId, Empty, Entity, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
-    PlatformDisplay, ScrollHandle, SharedString, Subscription, Task, TextStyle, WeakEntity, Window,
-    WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient, list, point,
-    pulsating_between,
+    ElementId, Empty, Entity, EntityId, FocusHandle, Focusable, Hsla, ListOffset, ListState,
+    ObjectFit, PlatformDisplay, ScrollHandle, SharedString, Subscription, Task, TextStyle,
+    WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient,
+    list, point, pulsating_between,
 };
 use language::Buffer;
 use language_model::LanguageModelRegistry;
@@ -68,6 +68,7 @@ use crate::acp::ModeSelector;
 use crate::acp::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::acp::message_editor::{MessageEditor, MessageEditorEvent};
 use crate::agent_diff::AgentDiff;
+use crate::agent_panel::AgentThreadEditorTabItem;
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
@@ -232,6 +233,49 @@ impl AcpServerView {
 
         connected.navigate_to_session(session_id);
         if let Some(view) = self.active_thread() {
+            view.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn open_session(
+        &mut self,
+        session: AgentSessionInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = session.session_id.clone();
+        if let Some(connected) = self.as_connected_mut()
+            && connected.threads.contains_key(&session_id)
+        {
+            connected.navigate_to_session(session_id);
+            if let Some(view) = self.active_thread() {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        let state = Self::initial_state(
+            self.agent.clone(),
+            Some(session),
+            self.project.clone(),
+            None,
+            window,
+            cx,
+        );
+        self.set_server_state(state, cx);
+
+        if let Some(view) = self.active_thread() {
+            view.update(cx, |this, cx| {
+                this.message_editor.update(cx, |editor, cx| {
+                    editor.set_command_state(
+                        this.prompt_capabilities.clone(),
+                        this.available_commands.clone(),
+                        cx,
+                    );
+                });
+            });
             view.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
@@ -2151,7 +2195,7 @@ impl AcpServerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.play_notification_sound(window, cx);
+        self.play_notification_sound(cx.entity_id(), window, cx);
         self.show_notification(caption, icon, window, cx);
     }
 
@@ -2163,9 +2207,37 @@ impl AcpServerView {
         multi_workspace.read(cx).workspace() == &workspace && AgentPanel::is_visible(&workspace, cx)
     }
 
-    fn agent_status_visible(&self, window: &Window, cx: &App) -> bool {
+    fn thread_view_visible_in_workspace(
+        &self,
+        thread_view_id: EntityId,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+
+        if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten()
+            && multi_workspace.read(cx).workspace() != &workspace
+        {
+            return false;
+        }
+
+        workspace.read(cx).panes().iter().any(|pane| {
+            pane.read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<AgentThreadEditorTabItem>())
+                .is_some_and(|item| item.read(cx).thread_view_id() == thread_view_id)
+        })
+    }
+
+    fn agent_status_visible(&self, thread_view_id: EntityId, window: &Window, cx: &App) -> bool {
         if !window.is_window_active() {
             return false;
+        }
+
+        if self.thread_view_visible_in_workspace(thread_view_id, window, cx) {
+            return true;
         }
 
         if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
@@ -2178,16 +2250,9 @@ impl AcpServerView {
         }
     }
 
-    fn play_notification_sound(&self, window: &Window, cx: &mut App) {
+    fn play_notification_sound(&self, thread_view_id: EntityId, window: &Window, cx: &mut App) {
         let settings = AgentSettings::get_global(cx);
-        let visible = window.is_window_active()
-            && if let Some(mw) = window.root::<MultiWorkspace>().flatten() {
-                self.agent_panel_visible(&mw, cx)
-            } else {
-                self.workspace
-                    .upgrade()
-                    .is_some_and(|workspace| AgentPanel::is_visible(&workspace, cx))
-            };
+        let visible = self.agent_status_visible(thread_view_id, window, cx);
         if settings.play_sound_when_agent_done && !visible {
             Audio::play_sound(Sound::AgentDone, cx);
         }
@@ -2206,7 +2271,7 @@ impl AcpServerView {
 
         let settings = AgentSettings::get_global(cx);
 
-        let should_notify = !self.agent_status_visible(window, cx);
+        let should_notify = !self.agent_status_visible(cx.entity_id(), window, cx);
 
         if !should_notify {
             return;
@@ -2243,6 +2308,8 @@ impl AcpServerView {
         cx: &mut Context<Self>,
     ) {
         let options = AgentNotification::window_options(screen, cx);
+        let thread_view_id = cx.entity_id();
+        let thread_view_id_for_activation = thread_view_id;
 
         let project_name = self.workspace.upgrade().and_then(|workspace| {
             workspace
@@ -2267,7 +2334,7 @@ impl AcpServerView {
                 .entry(screen_window)
                 .or_insert_with(Vec::new)
                 .push(cx.subscribe_in(&pop_up, window, {
-                    |this, _, event, window, cx| match event {
+                    move |this, _, event, window, cx| match event {
                         AgentNotificationEvent::Accepted => {
                             let Some(handle) = window.window_handle().downcast::<MultiWorkspace>()
                             else {
@@ -2284,9 +2351,47 @@ impl AcpServerView {
                                         window.activate_window();
                                         if let Some(workspace) = workspace_handle.upgrade() {
                                             multi_workspace.activate(workspace.clone(), cx);
-                                            workspace.update(cx, |workspace, cx| {
-                                                workspace.focus_panel::<AgentPanel>(window, cx);
-                                            });
+
+                                            let focused_editor_item =
+                                                workspace.update(cx, |workspace, cx| {
+                                                    let editor_item = workspace
+                                                        .items_of_type::<AgentThreadEditorTabItem>(
+                                                            cx,
+                                                        )
+                                                        .find(|item| {
+                                                            item.read(cx).thread_view_id()
+                                                                == thread_view_id
+                                                        });
+                                                    if let Some(editor_item) = editor_item {
+                                                        workspace.activate_item(
+                                                            &editor_item,
+                                                            true,
+                                                            true,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                });
+
+                                            if !focused_editor_item {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    workspace.focus_panel::<AgentPanel>(window, cx);
+                                                    if let Some(panel) =
+                                                        workspace.panel::<AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.focus_thread_view_from_notification(
+                                                                thread_view_id,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
                                         }
                                     })
                                     .log_err();
@@ -2310,7 +2415,7 @@ impl AcpServerView {
                     let pop_up_weak = pop_up.downgrade();
 
                     cx.observe_window_activation(window, move |this, window, cx| {
-                        if this.agent_status_visible(window, cx)
+                        if this.agent_status_visible(thread_view_id_for_activation, window, cx)
                             && let Some(pop_up) = pop_up_weak.upgrade()
                         {
                             pop_up.update(cx, |notification, cx| {
@@ -3157,12 +3262,10 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_notification_when_panel_hidden(cx: &mut TestAppContext) {
+    async fn test_notification_when_panel_hidden_and_thread_not_visible(cx: &mut TestAppContext) {
         init_test(cx);
 
         let (thread_view, cx) = setup_thread_view(StubAgentServer::default_response(), cx).await;
-
-        add_to_workspace(thread_view.clone(), cx);
 
         let message_editor = message_editor(&thread_view, cx);
 
@@ -3178,12 +3281,37 @@ pub(crate) mod tests {
 
         cx.run_until_parked();
 
-        // Should show notification because window is active but panel is hidden
+        // Should show notification because the thread is not visible and panel is hidden.
         assert!(
             cx.windows()
                 .iter()
                 .any(|window| window.downcast::<AgentNotification>().is_some()),
             "Expected notification when panel is hidden"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_no_notification_when_thread_visible_in_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (thread_view, cx) = setup_thread_view(StubAgentServer::default_response(), cx).await;
+
+        add_as_agent_editor_tab(thread_view.clone(), cx);
+
+        let message_editor = message_editor(&thread_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+
+        active_thread(&thread_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+
+        cx.run_until_parked();
+
+        assert!(
+            !cx.windows()
+                .iter()
+                .any(|window| window.downcast::<AgentNotification>().is_some()),
+            "Expected no notification when the thread is visible in the editor"
         );
     }
 
@@ -3476,6 +3604,24 @@ pub(crate) mod tests {
                     window,
                     cx,
                 );
+            })
+            .unwrap();
+    }
+
+    fn add_as_agent_editor_tab(thread_view: Entity<AcpServerView>, cx: &mut VisualTestContext) {
+        let workspace = thread_view.read_with(cx, |thread_view, _cx| thread_view.workspace.clone());
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let item = cx.new(|cx| {
+                    AgentThreadEditorTabItem::new(
+                        thread_view.clone(),
+                        crate::agent_panel::AgentType::default(),
+                        cx,
+                    )
+                });
+                workspace.add_item_to_center(Box::new(item.clone()), window, cx);
+                workspace.activate_item(&item, true, true, window, cx);
             })
             .unwrap();
     }
