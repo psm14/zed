@@ -59,6 +59,7 @@ pub mod cursor_excerpt;
 pub mod example_spec;
 pub mod fim;
 mod license_detection;
+pub mod llama_cpp;
 pub mod mercury;
 pub mod ollama;
 mod onboarding_modal;
@@ -76,6 +77,7 @@ pub mod zeta;
 mod edit_prediction_tests;
 
 use crate::license_detection::LicenseDetectionWatcher;
+use crate::llama_cpp::LlamaCpp;
 use crate::mercury::Mercury;
 use crate::onboarding_modal::ZedPredictModal;
 pub use crate::prediction::EditPrediction;
@@ -139,6 +141,7 @@ pub struct EditPredictionStore {
     zeta2_raw_config: Option<Zeta2RawConfig>,
     pub sweep_ai: SweepAi,
     pub mercury: Mercury,
+    pub llama_cpp: LlamaCpp,
     data_collection_choice: DataCollectionChoice,
     reject_predictions_tx: mpsc::UnboundedSender<EditPredictionRejection>,
     shown_predictions: VecDeque<EditPrediction>,
@@ -152,6 +155,7 @@ pub enum EditPredictionModel {
     Fim { format: EditPredictionPromptFormat },
     Sweep,
     Mercury,
+    LlamaCpp,
 }
 
 #[derive(Clone)]
@@ -696,6 +700,7 @@ impl EditPredictionStore {
             zeta2_raw_config: Self::zeta2_raw_config_from_env(),
             sweep_ai: SweepAi::new(cx),
             mercury: Mercury::new(cx),
+            llama_cpp: LlamaCpp::new(),
 
             data_collection_choice,
             reject_predictions_tx: reject_tx,
@@ -755,6 +760,9 @@ impl EditPredictionStore {
                         edit_prediction_types::EditPredictionIconSet::new(IconName::AiOpenAiCompat)
                     }
                 }
+            EditPredictionModel::LlamaCpp => {
+                edit_prediction_types::EditPredictionIconSet::new(IconName::Ai)
+            }
             }
         }
     }
@@ -1312,6 +1320,7 @@ impl EditPredictionStore {
                     cx,
                 );
             }
+            EditPredictionModel::LlamaCpp => {}
             EditPredictionModel::Zeta1 | EditPredictionModel::Zeta2 => {
                 let is_cloud = !matches!(
                     all_language_settings(None, cx).edit_predictions.provider,
@@ -1479,7 +1488,9 @@ impl EditPredictionStore {
                     cx,
                 );
             }
-            EditPredictionModel::Sweep | EditPredictionModel::Fim { .. } => {}
+            EditPredictionModel::Sweep
+            | EditPredictionModel::LlamaCpp
+            | EditPredictionModel::Fim { .. } => {}
         }
     }
 
@@ -1677,6 +1688,7 @@ impl EditPredictionStore {
 fn is_ep_store_provider(provider: EditPredictionProvider) -> bool {
     match provider {
         EditPredictionProvider::Zed
+        | EditPredictionProvider::LlamaCpp
         | EditPredictionProvider::Sweep
         | EditPredictionProvider::Mercury
         | EditPredictionProvider::Ollama
@@ -1721,6 +1733,7 @@ impl EditPredictionStore {
                 | EditPredictionProvider::Sweep
                 | EditPredictionProvider::Mercury
                 | EditPredictionProvider::Experimental(_) => (true, 2),
+                EditPredictionProvider::LlamaCpp => (false, 1),
                 EditPredictionProvider::Ollama => (false, 1),
                 EditPredictionProvider::OpenAiCompatibleApi => (false, 2),
                 EditPredictionProvider::None
@@ -1965,6 +1978,7 @@ impl EditPredictionStore {
             EditPredictionModel::Fim { format } => fim::request_prediction(inputs, format, cx),
             EditPredictionModel::Sweep => self.sweep_ai.request_prediction_with_sweep(inputs, cx),
             EditPredictionModel::Mercury => self.mercury.request_prediction(inputs, cx),
+            EditPredictionModel::LlamaCpp => self.llama_cpp.request_prediction(inputs, cx),
         };
 
         cx.spawn(async move |this, cx| {

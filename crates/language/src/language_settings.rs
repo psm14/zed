@@ -398,6 +398,8 @@ pub struct EditPredictionSettings {
     pub codestral: CodestralSettings,
     /// Settings specific to Sweep.
     pub sweep: SweepSettings,
+    /// Settings specific to llama.cpp.
+    pub llama_cpp: LlamaCppSettings,
     /// Settings specific to Ollama.
     pub ollama: Option<OpenAiCompatibleEditPredictionSettings>,
     pub open_ai_compatible_api: Option<OpenAiCompatibleEditPredictionSettings>,
@@ -456,6 +458,16 @@ pub struct SweepSettings {
     /// diagnostics, file paths, repository names, and generated predictions
     /// to improve the service.
     pub privacy_mode: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LlamaCppSettings {
+    /// Optional model identifier for llama.cpp servers running in multi-model mode.
+    pub model: Option<String>,
+    /// Maximum tokens to generate.
+    pub max_output_tokens: u32,
+    /// Custom API URL to use for llama.cpp.
+    pub api_url: Arc<str>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -704,6 +716,12 @@ impl settings::Settings for AllLanguageSettings {
         let sweep_settings = SweepSettings {
             privacy_mode: sweep.privacy_mode.unwrap(),
         };
+        let llama_cpp = edit_predictions.llama_cpp.unwrap();
+        let llama_cpp_settings = LlamaCppSettings {
+            model: llama_cpp.model,
+            max_output_tokens: llama_cpp.max_output_tokens.unwrap(),
+            api_url: llama_cpp.api_url.unwrap().into(),
+        };
         let ollama = edit_predictions.ollama.unwrap();
         let ollama_settings = ollama
             .model
@@ -768,6 +786,7 @@ impl settings::Settings for AllLanguageSettings {
                 copilot: copilot_settings,
                 codestral: codestral_settings,
                 sweep: sweep_settings,
+                llama_cpp: llama_cpp_settings,
                 ollama: ollama_settings,
                 open_ai_compatible_api: openai_compatible_settings,
                 enabled_in_text_threads,

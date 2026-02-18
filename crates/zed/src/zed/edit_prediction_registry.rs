@@ -115,6 +115,15 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
         EditPredictionProvider::Zed => Some(EditPredictionProviderConfig::Zed(
             EditPredictionModel::Zeta1,
         )),
+        EditPredictionProvider::LlamaCpp => {
+            if edit_prediction::llama_cpp::is_available(cx) {
+                Some(EditPredictionProviderConfig::Zed(
+                    EditPredictionModel::LlamaCpp,
+                ))
+            } else {
+                None
+            }
+        }
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
             let custom_settings = if provider == EditPredictionProvider::Ollama {
@@ -200,6 +209,7 @@ impl EditPredictionProviderConfig {
                 EditPredictionModel::Fim { .. } => "FIM",
                 EditPredictionModel::Sweep => "Sweep",
                 EditPredictionModel::Mercury => "Mercury",
+                EditPredictionModel::LlamaCpp => "LlamaCpp",
             },
         }
     }
@@ -301,6 +311,11 @@ fn assign_edit_prediction_provider(
 
             if let Some(project) = editor.project() {
                 let has_model = ep_store.update(cx, |ep_store, cx| {
+                    if model == EditPredictionModel::LlamaCpp
+                        && !edit_prediction::llama_cpp::is_available(cx)
+                    {
+                        return false;
+                    }
                     ep_store.set_edit_prediction_model(model);
                     if let Some(buffer) = &singleton_buffer {
                         ep_store.register_buffer(buffer, project, cx);
