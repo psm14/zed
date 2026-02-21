@@ -760,9 +760,9 @@ impl EditPredictionStore {
                         edit_prediction_types::EditPredictionIconSet::new(IconName::AiOpenAiCompat)
                     }
                 }
+            }
             EditPredictionModel::LlamaCpp => {
                 edit_prediction_types::EditPredictionIconSet::new(IconName::Ai)
-            }
             }
         }
     }

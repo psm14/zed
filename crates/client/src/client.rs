@@ -711,7 +711,10 @@ impl Client {
             return Ok(self.trusted_authenticated_user_response(config.github_login, self.id()));
         }
 
-        self.cloud_client.get_authenticated_user().await
+        self.cloud_client
+            .get_authenticated_user()
+            .await
+            .map_err(Into::into)
     }
 
     pub fn set_id(&self, id: u64) -> &Self {
